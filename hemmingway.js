@@ -9,12 +9,14 @@ import { getActiveSession, setActiveSession, clearActiveSession } from "./lib/da
 import { launchHemmingway } from "./lib/features/launcher.js";
 import { handleRunReview, handleReviewAll, cancelReviewAll, handleSetGranularity } from "./lib/features/workflow.js";
 import { handleSaveAndCommit } from "./lib/features/saveHandler.js";
+import { loadHistoryRecords } from "./lib/features/historyViewer.js";
 import { buildDashboardTemplate, renderCanvasHtml, renderJumpOptions } from "./lib/ui/dashboardTemplate.js";
 import { testHemmingwayConnection } from "./lib/api/diagnostics.js";
 import { getUsageStats, resetUsage } from "./lib/data/usageTracker.js";
 import {
   SETTING_API_KEY,
   SETTING_BASE_URL,
+  SETTING_THINKING_EFFORT,
   DEFAULT_BASE_URL
 } from "./lib/constants.js";
 
@@ -65,11 +67,19 @@ const plugin = {
     const session = getActiveSession();
     const settings = app.settings || {};
     const usageStats = getUsageStats(app);
+    let historyRecords = [];
+
+    try {
+      historyRecords = await loadHistoryRecords(app);
+    } catch (err) {
+      console.warn("[Hemmingway] loadHistoryRecords failed:", err);
+    }
 
     return buildDashboardTemplate({
       session,
       settings,
       usageStats,
+      historyRecords,
       activeTab: activeTabState,
       activeTheme: activeThemeState
     });
@@ -103,6 +113,9 @@ const plugin = {
             if (payload.baseUrl !== undefined) {
               await app.setSetting(SETTING_BASE_URL, payload.baseUrl.trim());
             }
+            if (payload.thinkingEffort !== undefined) {
+              await app.setSetting(SETTING_THINKING_EFFORT, payload.thinkingEffort);
+            }
           }
           await app.alert("Settings saved successfully!");
           return buildStateResponse();
@@ -116,6 +129,21 @@ const plugin = {
         case "setPreset": {
           if (session) {
             session.presetId = args[1] || "human_polish";
+            session.customPrompt = "";
+          }
+          return buildStateResponse();
+        }
+
+        case "setCustomPrompt": {
+          if (session) {
+            session.customPrompt = (args[1] || "").trim();
+          }
+          return buildStateResponse();
+        }
+
+        case "clearCustomPrompt": {
+          if (session) {
+            session.customPrompt = "";
           }
           return buildStateResponse();
         }
@@ -170,6 +198,25 @@ const plugin = {
           return buildStateResponse();
         }
 
+        case "manualEditItem": {
+          const itemId = Number(args[1]);
+          const newText = args[2];
+          if (session && typeof itemId === "number") {
+            session.manualEdit(itemId, newText);
+          }
+          return buildStateResponse();
+        }
+
+        case "reReviewItem": {
+          const itemId = Number(args[1]);
+          const instruction = args[2] || "";
+          const res = await handleRunReview(app, itemId, instruction);
+          if (!res.ok) {
+            await app.alert(`Re-Review Error: ${res.error}`);
+          }
+          return buildStateResponse({ reviewResult: res });
+        }
+
         case "undo": {
           if (session) {
             session.undo();
@@ -191,6 +238,20 @@ const plugin = {
           return buildStateResponse();
         }
 
+        case "nextPending": {
+          if (session) {
+            session.nextPending();
+          }
+          return buildStateResponse();
+        }
+
+        case "prevPending": {
+          if (session) {
+            session.prevPending();
+          }
+          return buildStateResponse();
+        }
+
         case "jumpTo": {
           if (session) {
             session.jumpTo(Number(args[1]));
@@ -205,9 +266,42 @@ const plugin = {
           return buildStateResponse();
         }
 
+        case "saveAndCommit":
         case "applyToNote": {
-          const res = await handleSaveAndCommit(app);
+          const createAuditNotes = Boolean(args[1]);
+          const res = await handleSaveAndCommit(app, createAuditNotes);
           return buildStateResponse({ saveResult: res });
+        }
+
+        case "openNote": {
+          const targetUUID = args[1] || session?.noteUUID;
+          if (targetUUID) {
+            try {
+              if (typeof app.openNote === "function") {
+                await app.openNote(targetUUID);
+              } else if (typeof app.navigate === "function") {
+                await app.navigate(`https://www.amplenote.com/notes/${targetUUID}`);
+              }
+            } catch (e) {
+              console.warn("[Hemmingway] openNote error:", e);
+            }
+          }
+          return { ok: true };
+        }
+
+        case "clearSession": {
+          clearActiveSession();
+          return buildStateResponse();
+        }
+
+        case "refreshHistory": {
+          activeTabState = "history";
+          if (app.context && typeof app.context.renderEmbed === "function") {
+            await app.context.renderEmbed();
+          } else if (typeof app.renderEmbed === "function") {
+            await app.renderEmbed();
+          }
+          return buildStateResponse();
         }
 
         case "resetUsage": {

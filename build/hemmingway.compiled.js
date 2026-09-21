@@ -16,6 +16,8 @@ var SETTING_API_KEY = "Hemmingway API Key";
 var SETTING_THINKING_EFFORT = "Thinking Effort";
 var SETTING_BASE_URL = "Custom Base URL";
 var SETTING_USAGE_STATS = "Hemmingway Usage Stats";
+var TAG_HEMMINGWAY_HISTORY = "-reports/-hemmingway/-history";
+var TAG_HEMMINGWAY_CHANGES = "-reports/-hemmingway/-changes";
 var DEFAULT_BASE_URL = "https://hemmingway.io/v1";
 var DEFAULT_MODEL = "hemmingway-27b";
 var THINKING_EFFORT_MODES = {
@@ -94,6 +96,13 @@ var EDITORIAL_PRESETS = [
     description: "Fixes strictly spelling, punctuation, and grammatical mistakes with minimal stylistic modification.",
     systemPrompt: `You are a strict copyeditor. Fix only spelling errors, punctuation mistakes, typos, and grammatical errors. Strictly preserve the author's original vocabulary, phrasing, and markdown formatting.`
   }
+];
+var RE_REVIEW_REASONS = [
+  { id: "more_human", label: "Make it sound even more human", prompt: "The suggestion still feels slightly artificial. Rewrite to sound more conversational, direct, and naturally human." },
+  { id: "shorter_punchier", label: "Cut more fluff (Make punchier)", prompt: "Make this even more concise and punchy. Cut 20-30% of unnecessary words without losing meaning." },
+  { id: "preserve_voice", label: "Keep closer to my original phrasing", prompt: "This strayed too far from my style. Keep closer to my original phrasing and tone while polishing only awkward parts." },
+  { id: "grammar_only", label: "Fix grammar only (No rewrites)", prompt: "Make minimal changes: correct grammar, punctuation, and spelling only. Do not rewrite sentences." },
+  { id: "custom", label: "Custom instruction...", prompt: "" }
 ];
 
 // anp-26-hemmingway/lib/engine/tokenizer.js
@@ -275,6 +284,7 @@ var ReviewSession = class _ReviewSession {
     this.updatedAt = updatedAt;
     this.granularity = granularity;
     this.presetId = presetId;
+    this.customPrompt = "";
     this.diffViewMode = "clean";
     this.currentIndex = 0;
     this.undoStack = [];
@@ -360,6 +370,19 @@ var ReviewSession = class _ReviewSession {
     item.editedContent = newText;
     item.suggestion = newText;
     item.status = "edited";
+  }
+  /**
+   * Alias for edit().
+   */
+  manualEdit(id, newText) {
+    this.edit(id, newText);
+  }
+  /**
+   * Checks if undo is possible.
+   * @returns {boolean}
+   */
+  canUndo() {
+    return this.undoStack.length > 0;
   }
   /**
    * Pushes state snapshot to undo stack.
@@ -534,6 +557,7 @@ var ReviewSession = class _ReviewSession {
       updatedAt: this.updatedAt,
       granularity: this.granularity,
       presetId: this.presetId,
+      customPrompt: this.customPrompt,
       diffViewMode: this.diffViewMode,
       currentIndex: this.currentIndex,
       items: this.items
@@ -553,6 +577,7 @@ var ReviewSession = class _ReviewSession {
       granularity: data.granularity,
       presetId: data.presetId
     });
+    session.customPrompt = data.customPrompt || "";
     session.diffViewMode = data.diffViewMode || "clean";
     session.currentIndex = typeof data.currentIndex === "number" ? data.currentIndex : 0;
     if (Array.isArray(data.items)) {
@@ -828,10 +853,30 @@ function getEffectiveSystemPrompt(presetId, customPrompt = "") {
   const preset = EDITORIAL_PRESETS.find((p) => p.id === presetId);
   return preset ? preset.systemPrompt : EDITORIAL_PRESETS[0].systemPrompt;
 }
-async function handleRunReview(app, { customPrompt = "", thinkingEffort = null } = {}) {
+async function handleRunReview(app, targetItemId = null, instruction = "") {
   const session = getActiveSession();
   if (!session) return { ok: false, error: "No active review session found." };
-  const item = session.getCurrentItem();
+  let itemId = null;
+  let customInstr = "";
+  let thinkingEffort = null;
+  if (typeof targetItemId === "object" && targetItemId !== null) {
+    itemId = targetItemId.itemId ?? null;
+    customInstr = targetItemId.customPrompt || targetItemId.instruction || "";
+    thinkingEffort = targetItemId.thinkingEffort || null;
+  } else {
+    itemId = targetItemId;
+    customInstr = instruction || "";
+  }
+  let item = null;
+  if (typeof itemId === "number" && itemId >= 0) {
+    item = session.items.find((it) => it.id === itemId);
+    if (item) {
+      session.jumpTo(itemId);
+    }
+  }
+  if (!item) {
+    item = session.getCurrentItem();
+  }
   if (!item || !item.isInspectable) {
     return { ok: false, error: "Active item is not inspectable." };
   }
@@ -842,7 +887,13 @@ async function handleRunReview(app, { customPrompt = "", thinkingEffort = null }
     return { ok: false, error: "Please enter your Hemmingway API key in Plugin Settings." };
   }
   const client = new HemmingwayClient({ apiKey, baseUrl, model: DEFAULT_MODEL });
-  const systemPrompt = getEffectiveSystemPrompt(session.presetId, customPrompt);
+  let systemPrompt = getEffectiveSystemPrompt(session.presetId, session.customPrompt);
+  if (customInstr && customInstr.trim()) {
+    systemPrompt += `
+
+Specific Editorial Instruction for this section:
+${customInstr.trim()}`;
+  }
   try {
     const res = await client.complete({
       prompt: item.original,
@@ -927,38 +978,371 @@ function handleSetGranularity(app, newGranularity) {
   setActiveSession(fresh);
 }
 
+// anp-26-hemmingway/lib/data/historyManager.js
+function getSafeMarkdownFence(content = "") {
+  if (typeof content !== "string") return "```";
+  const matches = content.match(/`{3,}/g) || [];
+  let maxLen = 2;
+  for (const m of matches) {
+    if (m.length > maxLen) maxLen = m.length;
+  }
+  return "`".repeat(maxLen + 1);
+}
+function generateHistoryRecord({ session, sourceNoteTitle, sourceNoteUUID, finalContent }) {
+  const now = /* @__PURE__ */ new Date();
+  const timestamp = Math.floor(now.getTime() / 1e3);
+  const dateStr = now.toISOString().replace("T", " ").substring(0, 16);
+  const fullDateStr = now.toISOString().replace("T", " ").substring(0, 19) + " UTC";
+  const stats = session.getStats();
+  const titleName = sourceNoteTitle || "Untitled Note";
+  const sourceLink = sourceNoteUUID ? `[${titleName}](https://www.amplenote.com/notes/${sourceNoteUUID})` : titleName;
+  const record = {
+    schemaVersion: 1,
+    timestamp,
+    isoDate: now.toISOString(),
+    sourceNote: {
+      uuid: sourceNoteUUID,
+      title: titleName
+    },
+    session: {
+      presetId: session.presetId,
+      customPrompt: session.customPrompt || "",
+      granularity: session.granularity,
+      stats
+    },
+    items: session.items.map((item) => ({
+      id: item.id,
+      original: item.original,
+      type: item.type,
+      status: item.status,
+      suggestion: item.suggestion,
+      reasoning: item.reasoning,
+      editedContent: item.editedContent
+    })),
+    originalContent: session.initialContent,
+    finalContent
+  };
+  const jsonPayload = JSON.stringify(record, null, 2);
+  const fence = getSafeMarkdownFence(jsonPayload);
+  const markdownContent = `# \u{1F4DC} Hemmingway Review History: ${titleName}
+
+> **Source Note:** ${sourceLink}  
+> **Timestamp:** ${fullDateStr}  
+> **Model:** \`hemmingway-27b\` \xB7 Preset: \`${session.presetId}\`  
+> **Changes:** **${stats.accepted}** accepted, **${stats.edited}** edited, **${stats.rejected}** rejected (out of ${stats.totalInspectable} items)
+
+---
+
+## \u{1F4BE} Audit Log Payload
+
+${fence}json
+${jsonPayload}
+${fence}
+`;
+  return {
+    name: `Hemmingway History: ${titleName} (${dateStr})`,
+    tags: [TAG_HEMMINGWAY_HISTORY],
+    content: markdownContent
+  };
+}
+function parseHistoryNotes(notes = []) {
+  if (!Array.isArray(notes)) return [];
+  const jsonRecords = [];
+  const fallbackRecords = [];
+  const knownTimestamps = /* @__PURE__ */ new Set();
+  const knownSourceNoteTimestamps = /* @__PURE__ */ new Set();
+  for (const note of notes) {
+    if (!note || typeof note !== "object") continue;
+    const raw = note.body || note.content || "";
+    const match = raw.match(/```json\s*([\s\S]*?)\s*```/);
+    if (match && match[1]) {
+      try {
+        const parsed = JSON.parse(match[1]);
+        const ts = parsed.timestamp || parseInt(note.name, 10) || 0;
+        const key = `${parsed.sourceNote?.uuid || ""}_${Math.floor(ts / 60)}`;
+        knownTimestamps.add(ts);
+        knownSourceNoteTimestamps.add(key);
+        jsonRecords.push({
+          noteUUID: note.uuid,
+          noteName: note.name,
+          ...parsed,
+          timestamp: ts
+        });
+      } catch (err) {
+        console.warn("[Hemmingway] Could not parse history record for note:", note.uuid, err);
+      }
+    } else if (raw && (raw.includes("Hemmingway Review") || raw.includes("Hemmingway Changes") || raw.includes("Hemmingway History"))) {
+      const titleMatch = raw.match(/# (?:(?:📝|📜) )?(?:Hemmingway (?:Polish|Review) )?(?:Changes|Report)?(?:\s*:\s*|\s+)(.*)/i) || raw.match(/Source Note:\s*\[([^\]]+)\]/i);
+      const uuidMatch = raw.match(/amplenote\.com\/notes\/([a-zA-Z0-9_-]+)/i);
+      const dateMatch = raw.match(/\*\*Date:\*\*\s*(.*)/i) || raw.match(/\*\*Review Date:\*\*\s*(.*)/i) || raw.match(/Timestamp:\s*(.*)/i);
+      const changesMatch = raw.match(/(\d+)\s*(?:accepted|changes?|items?)/i);
+      const ts = parseInt(note.name, 10) || (dateMatch ? Math.floor(new Date(dateMatch[1]).getTime() / 1e3) : 0);
+      fallbackRecords.push({
+        noteUUID: note.uuid,
+        noteName: note.name,
+        timestamp: ts || Math.floor(Date.now() / 1e3),
+        isoDate: dateMatch ? dateMatch[1].trim() : (/* @__PURE__ */ new Date()).toISOString(),
+        sourceNote: {
+          uuid: uuidMatch ? uuidMatch[1] : note.uuid,
+          title: titleMatch ? titleMatch[1].trim() : note.name || "Hemmingway Review"
+        },
+        session: {
+          presetId: "human_polish",
+          granularity: "paragraph",
+          stats: { accepted: changesMatch ? parseInt(changesMatch[1], 10) : 1 }
+        }
+      });
+    }
+  }
+  const finalRecords = [...jsonRecords];
+  for (const fb of fallbackRecords) {
+    const key = `${fb.sourceNote?.uuid || ""}_${Math.floor(fb.timestamp / 60)}`;
+    if (!knownTimestamps.has(fb.timestamp) && !knownSourceNoteTimestamps.has(key)) {
+      finalRecords.push(fb);
+    }
+  }
+  return finalRecords.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+}
+
+// anp-26-hemmingway/lib/data/reportGenerator.js
+function generateChangesReport({ session, sourceNoteTitle, sourceNoteUUID, finalContent }) {
+  const now = /* @__PURE__ */ new Date();
+  const dateStr = now.toISOString().replace("T", " ").substring(0, 16);
+  const fullDateStr = now.toISOString().replace("T", " ").substring(0, 19) + " UTC";
+  const stats = session.getStats();
+  const titleName = sourceNoteTitle || "Untitled Note";
+  const sourceLink = sourceNoteUUID ? `[${titleName}](https://www.amplenote.com/notes/${sourceNoteUUID})` : titleName;
+  const promptName = session.customPrompt ? `Custom: "${session.customPrompt}"` : `Preset: ${session.presetId.replace(/_/g, " ")}`;
+  const fence = getSafeMarkdownFence(session.initialContent || "");
+  const md = `# \u{1F4DD} Hemmingway Polish Changes: ${titleName}
+
+> **Source Note:** ${sourceLink}  
+> **Review Date:** ${fullDateStr}  
+> **Model:** \`hemmingway-27b\` \xB7 **Granularity:** \`${session.granularity.toUpperCase()}\`  
+> **Style:** *${promptName}*  
+> **Results:** **${stats.accepted}** accepted, **${stats.edited}** edited, **${stats.rejected}** kept original (out of ${stats.totalInspectable} items)
+
+---
+
+## \u{1F4CA} Itemized Changes
+
+${generateItemChangesTable(session.items)}
+
+---
+
+## \u{1F4C4} Complete Revised Document
+
+${finalContent}
+
+---
+
+## \u{1F4DC} Original Document Snapshot
+
+<details>
+<summary>Click to view original text before Hemmingway review</summary>
+
+${fence}markdown
+${session.initialContent}
+${fence}
+
+</details>
+
+---
+*Generated automatically by Amplenote Hemmingway Writing Assistant*
+`;
+  return {
+    name: `Hemmingway Changes: ${titleName} (${dateStr})`,
+    tags: [TAG_HEMMINGWAY_CHANGES],
+    content: md
+  };
+}
+function generateItemChangesTable(items) {
+  const inspectableItems = items.filter((i) => i.isInspectable);
+  if (inspectableItems.length === 0) {
+    return "*No inspectable items in this review pass.*";
+  }
+  const changeBlocks = inspectableItems.map((item, idx) => {
+    let statusBadge = "\u274C Kept Original";
+    let appliedText = item.original;
+    if (item.status === "accepted") {
+      statusBadge = "\u2705 Accepted";
+      appliedText = item.suggestion || item.original;
+    } else if (item.status === "edited") {
+      statusBadge = "\u270F\uFE0F Manually Edited";
+      appliedText = item.editedContent || item.suggestion || item.original;
+    } else if (item.status === "no_change") {
+      statusBadge = "\u2713 Clean / No Changes";
+    }
+    return `### Item #${idx + 1} (${statusBadge} \xB7 *${item.type}*)
+- **Original Draft:**  
+  ${item.original}
+- **Hemmingway Suggestion:**  
+  ${appliedText}
+${item.reasoning ? `- **Hemmingway-1 Reasoning:**  
+  > ${item.reasoning.replace(/\n/g, "\n  > ")}` : ""}
+`;
+  });
+  return changeBlocks.join("\n---\n\n");
+}
+
 // anp-26-hemmingway/lib/features/saveHandler.js
-async function handleSaveAndCommit(app, { force = false } = {}) {
+async function handleSaveAndCommit(app, createAuditNotes = false) {
   const session = getActiveSession();
   if (!session) {
     return { success: false, error: "No active review session." };
   }
-  if (!force) {
+  const noteUUID = session.noteUUID;
+  if (!noteUUID || typeof noteUUID !== "string") {
+    return { success: false, error: "Target note UUID is missing or invalid." };
+  }
+  const finalContent = session.getReconstructedContent();
+  if (typeof app.getNoteContent === "function") {
     try {
-      const liveNote = await app.findNote({ uuid: session.noteUUID });
-      if (liveNote && liveNote.updated && session.updatedAt) {
-        if (liveNote.updated > session.updatedAt + 2e3) {
-          return {
-            success: false,
-            stale: true,
-            error: "This note was modified in Amplenote while the review session was open. Overwriting may lose recent external changes. Proceed anyway?"
-          };
+      const currentContent = await app.getNoteContent({ uuid: noteUUID });
+      if (currentContent && session.initialContent) {
+        const normCurrent = currentContent.replace(/\r\n/g, "\n").trim();
+        const normOriginal = session.initialContent.replace(/\r\n/g, "\n").trim();
+        if (normCurrent !== normOriginal && typeof app.prompt === "function") {
+          try {
+            const proceed = await app.prompt("Warning: Note Modified Externally", {
+              inputs: [
+                {
+                  label: "The source note was modified outside Hemmingway. Overwrite with reviewed version?",
+                  type: "checkbox",
+                  value: true
+                }
+              ]
+            });
+            if (proceed !== null && proceed !== void 0) {
+              const isConfirmed = typeof proceed === "object" ? Boolean(proceed["The source note was modified outside Hemmingway. Overwrite with reviewed version?"] ?? proceed[0]) : Boolean(proceed);
+              if (!isConfirmed) {
+                return { success: false, cancelled: true };
+              }
+            }
+          } catch {
+          }
         }
       }
     } catch (checkErr) {
       console.warn("[Hemmingway] Stale note check warning:", checkErr);
     }
   }
-  const finalContent = session.getReconstructedContent();
   try {
-    await app.replaceNoteContent({ uuid: session.noteUUID }, finalContent);
-    clearActiveSession();
-    await app.alert("Changes successfully applied to your note!");
-    return { success: true };
+    await app.replaceNoteContent({ uuid: noteUUID }, finalContent);
   } catch (err) {
-    const msg = `Failed to save changes: ${err.message || String(err)}`;
-    await app.alert(msg);
+    const msg = `Failed to save changes: ${err?.message || String(err)}`;
     return { success: false, error: msg };
+  }
+  let changesNoteUUID = null;
+  let historyNoteUUID = null;
+  if (createAuditNotes) {
+    try {
+      const changesReport = generateChangesReport({
+        session,
+        sourceNoteTitle: session.noteTitle,
+        sourceNoteUUID: session.noteUUID,
+        finalContent
+      });
+      changesNoteUUID = await app.createNote(changesReport.name, changesReport.tags);
+      if (changesNoteUUID) {
+        await app.insertNoteContent({ uuid: changesNoteUUID }, changesReport.content);
+      }
+    } catch (e) {
+      console.warn("[Hemmingway] Could not create changes report note:", e);
+    }
+    try {
+      const historyRecord = generateHistoryRecord({
+        session,
+        sourceNoteTitle: session.noteTitle,
+        sourceNoteUUID: session.noteUUID,
+        finalContent
+      });
+      historyNoteUUID = await app.createNote(historyRecord.name, historyRecord.tags);
+      if (historyNoteUUID) {
+        await app.insertNoteContent({ uuid: historyNoteUUID }, historyRecord.content);
+      }
+    } catch (e) {
+      console.warn("[Hemmingway] Could not create history record note:", e);
+    }
+  }
+  return {
+    success: true,
+    noteUUID: session.noteUUID,
+    noteTitle: session.noteTitle,
+    changesNoteUUID,
+    historyNoteUUID
+  };
+}
+
+// anp-26-hemmingway/lib/features/historyViewer.js
+async function loadHistoryRecords(app) {
+  try {
+    const noteMap = /* @__PURE__ */ new Map();
+    const historyQueries = [
+      { tag: TAG_HEMMINGWAY_HISTORY },
+      { tag: "reports/hemmingway/history" },
+      { query: "tag:-reports/-hemmingway/-history" },
+      { query: "Hemmingway Review History Record" }
+    ];
+    for (const q of historyQueries) {
+      try {
+        const found = await app.filterNotes(q);
+        if (Array.isArray(found)) {
+          for (const n of found) {
+            if (n && n.uuid && !noteMap.has(n.uuid)) {
+              noteMap.set(n.uuid, n);
+            }
+          }
+        }
+      } catch {
+      }
+    }
+    if (noteMap.size === 0) {
+      const fallbackQueries = [
+        { tag: TAG_HEMMINGWAY_CHANGES },
+        { tag: "reports/hemmingway/changes" },
+        { query: "tag:-reports/-hemmingway/-changes" },
+        { query: "Hemmingway Polish Changes" }
+      ];
+      for (const q of fallbackQueries) {
+        try {
+          const found = await app.filterNotes(q);
+          if (Array.isArray(found)) {
+            for (const n of found) {
+              if (n && n.uuid && !noteMap.has(n.uuid)) {
+                noteMap.set(n.uuid, n);
+              }
+            }
+          }
+        } catch {
+        }
+      }
+    }
+    if (noteMap.size === 0) {
+      return [];
+    }
+    const populatedNotes = [];
+    const notesArray = Array.from(noteMap.values()).slice(0, 40);
+    for (const n of notesArray) {
+      try {
+        const body = await app.getNoteContent({ uuid: n.uuid });
+        populatedNotes.push({
+          uuid: n.uuid,
+          name: n.name,
+          body
+        });
+      } catch {
+        populatedNotes.push({
+          uuid: n.uuid,
+          name: n.name,
+          body: ""
+        });
+      }
+    }
+    return parseHistoryNotes(populatedNotes);
+  } catch (err) {
+    console.error("[Hemmingway] Error loading history records:", err);
+    return [];
   }
 }
 
@@ -1702,8 +2086,270 @@ body {
   color: var(--hm-danger);
   border: 1px solid var(--hm-danger);
 }
+.hm-status-edited {
+  background: rgba(245, 158, 11, 0.15);
+  color: #f59e0b;
+  border: 1px solid #f59e0b;
+}
 .hm-status-no_change {
   background: var(--hm-bg-sidebar);
+  color: var(--hm-text-muted);
+}
+
+/* Universal Sandboxed-Safe In-DOM Modal */
+.hm-modal-backdrop {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(4px);
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  animation: hmFadeIn 0.15s ease-out;
+}
+@keyframes hmFadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.hm-modal-box {
+  background: var(--hm-bg-card);
+  border: 1px solid var(--hm-border);
+  border-radius: var(--hm-radius-md);
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.6);
+  width: 100%;
+  max-width: 560px;
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  animation: hmModalSlideUp 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.hm-modal-box.hm-modal-large {
+  max-width: 840px;
+  max-height: 88vh;
+}
+
+.hm-modal-box.enlarged {
+  max-width: calc(100vw - 36px) !important;
+  width: calc(100vw - 36px) !important;
+  max-height: calc(100vh - 36px) !important;
+  height: calc(100vh - 36px) !important;
+  border-radius: var(--hm-radius-sm);
+}
+
+@keyframes hmModalSlideUp {
+  from { transform: translateY(20px) scale(0.97); opacity: 0; }
+  to { transform: translateY(0) scale(1); opacity: 1; }
+}
+
+.hm-modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--hm-border);
+  background: var(--hm-bg-sidebar);
+}
+
+.hm-modal-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--hm-text-main);
+  margin: 0;
+}
+
+.hm-modal-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.hm-modal-enlarge-btn, .hm-modal-close {
+  background: var(--hm-bg-card);
+  border: 1px solid var(--hm-border);
+  color: var(--hm-text-muted);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 4px 8px;
+  border-radius: var(--hm-radius-sm);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s ease;
+}
+
+.hm-modal-enlarge-btn:hover, .hm-modal-close:hover {
+  color: var(--hm-text-main);
+  border-color: var(--hm-accent);
+}
+
+.hm-modal-body {
+  padding: 20px;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.hm-modal-message {
+  font-size: 13.5px;
+  color: var(--hm-text-muted);
+  line-height: 1.5;
+  margin-bottom: 14px;
+}
+
+.hm-modal-input {
+  width: 100%;
+  padding: 12px 14px;
+  background: var(--hm-bg-input);
+  border: 1px solid var(--hm-border);
+  border-radius: var(--hm-radius-sm);
+  color: var(--hm-text-main);
+  font-size: 14px;
+  font-family: inherit;
+  outline: none;
+  transition: border-color 0.15s ease;
+  box-sizing: border-box;
+}
+
+.hm-modal-input:focus {
+  border-color: var(--hm-accent);
+}
+
+.hm-modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 20px;
+  border-top: 1px solid var(--hm-border);
+  background: var(--hm-bg-sidebar);
+}
+
+/* Radio choice list inside modal */
+.hm-modal-radio-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.hm-modal-radio-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 14px;
+  background: var(--hm-bg-sidebar);
+  border: 1px solid var(--hm-border);
+  border-radius: var(--hm-radius-sm);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.hm-modal-radio-item:hover {
+  border-color: var(--hm-accent);
+}
+
+.hm-modal-radio-item.selected {
+  border-color: var(--hm-accent);
+  background: rgba(var(--hm-accent-rgb), 0.1);
+}
+
+/* Top Progress Loader */
+.hm-top-loader {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background: transparent;
+  z-index: 10000;
+  display: none;
+  overflow: hidden;
+}
+
+.hm-top-loader-bar {
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(90deg, var(--hm-accent), var(--hm-success));
+  transform-origin: left;
+  animation: hmLoaderAnim 1.2s infinite ease-in-out;
+}
+
+@keyframes hmLoaderAnim {
+  0% { transform: scaleX(0.1) translateX(-10%); }
+  50% { transform: scaleX(0.7) translateX(30%); }
+  100% { transform: scaleX(0.2) translateX(500%); }
+}
+
+/* Badges & Pills */
+.hm-change-count-pill {
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-size: 11px;
+  font-weight: 700;
+  background: var(--hm-bg-sidebar);
+  color: var(--hm-accent);
+  border: 1px solid var(--hm-border);
+}
+
+.hm-word-count-badge {
+  font-size: 11.5px;
+  color: var(--hm-text-muted);
+  font-family: ui-monospace, monospace;
+  display: flex;
+  gap: 12px;
+}
+
+/* History view styles */
+.hm-history-container {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 30px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.hm-history-card {
+  background: var(--hm-bg-card);
+  border: 1px solid var(--hm-border);
+  border-radius: var(--hm-radius-md);
+  padding: 18px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  transition: transform 0.15s ease, border-color 0.15s ease;
+}
+
+.hm-history-card:hover {
+  border-color: var(--hm-accent);
+  transform: translateY(-1px);
+}
+
+.hm-history-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.hm-history-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--hm-text-main);
+  text-decoration: none;
+}
+
+.hm-history-meta {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  font-size: 12px;
   color: var(--hm-text-muted);
 }
 `;
@@ -1823,11 +2469,11 @@ function renderSideBySide(oldText, newText) {
     <div class="hm-diff-side-by-side">
       <div class="hm-diff-pane hm-diff-pane-left">
         <div class="hm-pane-header">Original</div>
-        <div class="hm-pane-body">${leftHtml.replace(/\n/g, "<br>")}</div>
+        <div class="hm-pane-body" id="original-pane" style="overflow-y: auto; max-height: 480px;">${leftHtml.replace(/\n/g, "<br>")}</div>
       </div>
       <div class="hm-diff-pane hm-diff-pane-right">
         <div class="hm-pane-header">Hemmingway Polish</div>
-        <div class="hm-pane-body">${rightHtml.replace(/\n/g, "<br>")}</div>
+        <div class="hm-pane-body" id="suggestion-pane" style="overflow-y: auto; max-height: 480px;">${rightHtml.replace(/\n/g, "<br>")}</div>
       </div>
     </div>
   `;
@@ -1941,6 +2587,22 @@ function safeJsonEmbed(obj) {
   if (obj === null || obj === void 0) return "null";
   return JSON.stringify(obj).replace(/</g, "\\u003c").replace(/>/g, "\\u003e").replace(/\u2028/g, "\\u2028").replace(/\u2029/g, "\\u2029");
 }
+function getItemStatusIcon(status) {
+  switch (status) {
+    case "accepted":
+      return "\u2713";
+    case "rejected":
+      return "\u2715";
+    case "edited":
+      return "\u270E";
+    case "no_change":
+      return "\u2261";
+    case "ready":
+      return "\u25CF";
+    default:
+      return "\u25CB";
+  }
+}
 function renderJumpOptions(session) {
   if (!session || !session.items) {
     return `<option value="0">No inspectable items</option>`;
@@ -1952,10 +2614,71 @@ function renderJumpOptions(session) {
   const currentItem = session.getCurrentItem();
   return inspectables.map((it, idx) => {
     const isCur = it.id === currentItem?.id;
-    const icon = it.status === "accepted" ? "\u2713" : it.status === "rejected" ? "\u2715" : it.status === "ready" ? "\u25CF" : "\u25CB";
+    const icon = getItemStatusIcon(it.status);
     const snippet = (it.original || "").trim().substring(0, 32);
     return `<option value="${it.id}" ${isCur ? "selected" : ""}>${icon} #${idx + 1}: ${escapeHtml(snippet)}...</option>`;
   }).join("");
+}
+function renderActionButtons(currentItem, canUndo) {
+  if (!currentItem) return "";
+  const id = currentItem.id;
+  const status = currentItem.status || "pending";
+  if (status === "pending") {
+    return `
+      <button class="hm-btn hm-btn-primary" onclick="reviewCurrentChunk()">
+        \u26A1 Polish This Item
+      </button>
+      <button class="hm-btn hm-btn-secondary" onclick="promptManualEdit(${id})">
+        \u270F\uFE0F Manual Edit
+      </button>
+    `;
+  }
+  if (status === "ready") {
+    return `
+      <button id="btn-accept" class="hm-btn hm-btn-success" onclick="acceptCurrent()">
+        \u2713 Accept <kbd style="margin-left: 4px; background: rgba(0,0,0,0.2); border: none; color: #fff;">A</kbd>
+      </button>
+      <button id="btn-reject" class="hm-btn hm-btn-secondary" onclick="rejectCurrent()">
+        \u2715 Reject <kbd style="margin-left: 4px; background: rgba(0,0,0,0.2); border: none; color: inherit;">R</kbd>
+      </button>
+      <button class="hm-btn hm-btn-secondary" onclick="promptManualEdit(${id})">
+        \u270F\uFE0F Edit
+      </button>
+      <button class="hm-btn hm-btn-secondary" onclick="openReReviewDialog(${id})">
+        \u{1F504} Re-Review
+      </button>
+      ${canUndo ? `<button id="btn-undo" class="hm-btn hm-btn-secondary" onclick="undoAction()">\u21A9 Undo (U)</button>` : ""}
+    `;
+  }
+  if (status === "edited") {
+    return `
+      <button id="btn-accept" class="hm-btn hm-btn-success" onclick="acceptCurrent()">
+        \u2713 Accept Edit <kbd style="margin-left: 4px; background: rgba(0,0,0,0.2); border: none; color: #fff;">A</kbd>
+      </button>
+      <button id="btn-reject" class="hm-btn hm-btn-secondary" onclick="rejectCurrent()">
+        \u2715 Reject <kbd style="margin-left: 4px; background: rgba(0,0,0,0.2); border: none; color: inherit;">R</kbd>
+      </button>
+      <button class="hm-btn hm-btn-secondary" onclick="promptManualEdit(${id})">
+        \u270F\uFE0F Edit
+      </button>
+      <button class="hm-btn hm-btn-secondary" onclick="openReReviewDialog(${id})">
+        \u{1F504} Re-Review
+      </button>
+      ${canUndo ? `<button id="btn-undo" class="hm-btn hm-btn-secondary" onclick="undoAction()">\u21A9 Undo (U)</button>` : ""}
+    `;
+  }
+  return `
+    <span class="hm-status-tag hm-status-${status}">
+      ${status === "accepted" ? "\u2713 Accepted" : status === "rejected" ? "\u2715 Kept Original" : "\u2713 No Changes"}
+    </span>
+    ${canUndo ? `<button id="btn-undo" class="hm-btn hm-btn-secondary" onclick="undoAction()">\u21A9 Undo (U)</button>` : ""}
+    <button class="hm-btn hm-btn-secondary" onclick="promptManualEdit(${id})">
+      \u270F\uFE0F Edit
+    </button>
+    <button class="hm-btn hm-btn-secondary" onclick="openReReviewDialog(${id})">
+      \u{1F504} Re-Review
+    </button>
+  `;
 }
 function renderCanvasHtml(session) {
   if (!session) {
@@ -1980,7 +2703,11 @@ function renderCanvasHtml(session) {
   const inspectableIdx = inspectables.indexOf(currentItem);
   const itemNum = inspectableIdx >= 0 ? inspectableIdx + 1 : 1;
   const mode = session.diffViewMode || "clean";
-  const isReady = currentItem?.status === "ready" || currentItem?.status === "edited";
+  const origWords = (currentItem?.original || "").trim().split(/\s+/).filter(Boolean).length;
+  const suggText = currentItem?.editedContent || currentItem?.suggestion || currentItem?.original || "";
+  const suggWords = suggText.trim().split(/\s+/).filter(Boolean).length;
+  const diffWords = suggWords - origWords;
+  const canUndo = typeof session.canUndo === "function" ? session.canUndo() : session.undoStack && session.undoStack.length > 0;
   return `
     <!-- View Modes Toolbar -->
     <div class="hm-canvas-toolbar">
@@ -1990,6 +2717,13 @@ function renderCanvasHtml(session) {
         <button class="hm-view-mode-btn ${mode === "side" ? "active" : ""}" onclick="setViewMode('side')">\u{1F465} Side-by-Side</button>
         <button class="hm-view-mode-btn ${mode === "changes" ? "active" : ""}" onclick="setViewMode('changes')">\u{1F4CB} Changes Only</button>
       </div>
+
+      <div class="hm-word-count-badge">
+        <span>Original: <strong>${origWords}</strong>w</span>
+        <span>Suggested: <strong>${suggWords}</strong>w</span>
+        <span>Diff: <strong>${diffWords >= 0 ? "+" + diffWords : diffWords}</strong>w</span>
+      </div>
+
       <div style="font-size: 12px; color: var(--hm-text-muted); display: flex; align-items: center; gap: 8px;">
         <span>Item <strong>#${itemNum}</strong> of <strong>${total}</strong></span>
         <span style="font-size: 14px;">&bull;</span>
@@ -2011,22 +2745,73 @@ function renderCanvasHtml(session) {
     <!-- Bottom Action Bar -->
     <footer class="hm-action-bar">
       <div class="hm-action-group">
-        <button id="btn-accept" class="hm-btn hm-btn-success" onclick="acceptCurrent()" ${isReady ? "" : "disabled style='opacity: 0.5; cursor: not-allowed;'"}>\u2713 Accept (A)</button>
-        <button id="btn-reject" class="hm-btn hm-btn-secondary" onclick="rejectCurrent()">\u2715 Reject (R)</button>
-        <button id="btn-undo" class="hm-btn hm-btn-secondary" onclick="undoAction()">\u21A9 Undo (U)</button>
+        ${renderActionButtons(currentItem, canUndo)}
       </div>
       <div class="hm-action-group">
-        <button class="hm-btn hm-btn-secondary" onclick="navigatePrev()">\u23EE Prev (P)</button>
-        <button class="hm-btn hm-btn-secondary" onclick="navigateNext()">Next (N) \u23ED</button>
+        <button class="hm-btn hm-btn-secondary" onclick="sendAction('prevPending')" title="Jump to previous unreviewed chunk">\u23EE Prev Pending</button>
+        <button class="hm-btn hm-btn-secondary" onclick="navigatePrev()">\u2190 Prev (P)</button>
+        <button class="hm-btn hm-btn-secondary" onclick="navigateNext()">Next (N) \u2192</button>
+        <button class="hm-btn hm-btn-secondary" onclick="sendAction('nextPending')" title="Jump to next unreviewed chunk">Next Pending \u23ED</button>
         <button id="btn-apply-note" class="hm-btn hm-btn-primary" onclick="applyToNote()">\u{1F4BE} Save to Note</button>
       </div>
     </footer>
+  `;
+}
+function renderHistoryView(historyRecords = []) {
+  if (!historyRecords || historyRecords.length === 0) {
+    return `
+      <div class="hm-history-container">
+        <div style="text-align: center; padding: 60px 20px; color: var(--hm-text-muted);">
+          <div style="font-size: 40px; margin-bottom: 12px;">\u{1F4DC}</div>
+          <h3 style="font-size: 16px; color: var(--hm-text-main); margin-bottom: 6px;">No Review History Found</h3>
+          <p style="font-size: 13px; line-height: 1.5;">
+            When you save a reviewed note with the Companion Report option enabled, full audit records and diff summaries are saved here.
+          </p>
+        </div>
+      </div>
+    `;
+  }
+  const cardsHtml = historyRecords.map((rec) => {
+    const title = rec.sourceNote?.title || rec.noteName || "Untitled Note";
+    const date = rec.isoDate ? rec.isoDate.replace("T", " ").substring(0, 16) : "Recent";
+    const model = "hemmingway-27b";
+    const accepted = rec.session?.stats?.accepted ?? (rec.session?.metrics?.accepted ?? 0);
+    const edited = rec.session?.stats?.edited ?? 0;
+    const rejected = rec.session?.stats?.rejected ?? 0;
+    return `
+      <div class="hm-history-card">
+        <div class="hm-history-header">
+          <a class="hm-history-title" href="javascript:void(0)" onclick="callHost('openNote', '${rec.noteUUID}')" title="Open record note in Amplenote">
+            \u{1F4C4} ${escapeHtml(title)} \u2197
+          </a>
+          <span style="font-size: 12px; color: var(--hm-text-muted); font-family: ui-monospace, monospace;">${escapeHtml(date)}</span>
+        </div>
+        <div class="hm-history-meta">
+          <span>Model: <code>${escapeHtml(model)}</code></span>
+          <span>&bull;</span>
+          <span>Accepted: <strong style="color: var(--hm-success);">${accepted}</strong></span>
+          ${edited > 0 ? `<span>&bull;</span><span>Edited: <strong style="color: #f59e0b;">${edited}</strong></span>` : ""}
+          <span>&bull;</span>
+          <span>Kept Original: <strong style="color: var(--hm-danger);">${rejected}</strong></span>
+        </div>
+      </div>
+    `;
+  }).join("");
+  return `
+    <div class="hm-history-container">
+      <div style="display: flex; justify-content: space-between; align-items: center;">
+        <h2 style="font-size: 18px; font-weight: 700;">\u{1F4DC} Review History Records (${historyRecords.length})</h2>
+        <button class="hm-btn hm-btn-secondary" style="font-size: 12px;" onclick="sendAction('refreshHistory')">\u{1F504} Refresh</button>
+      </div>
+      ${cardsHtml}
+    </div>
   `;
 }
 function buildDashboardTemplate({
   session,
   settings = {},
   usageStats = {},
+  historyRecords = [],
   activeTab = "review",
   activeTheme = "espresso"
 }) {
@@ -2037,11 +2822,13 @@ function buildDashboardTemplate({
     ready: 0,
     accepted: 0,
     rejected: 0,
+    edited: 0,
     progressPercent: 0
   };
   const hasApiKey = Boolean(settings[SETTING_API_KEY] && settings[SETTING_API_KEY].trim());
   const serializedSession = safeJsonEmbed(session ? session.toJSON() : null);
   const serializedStats = safeJsonEmbed(usageStats);
+  const serializedReasons = safeJsonEmbed(RE_REVIEW_REASONS);
   return `<!DOCTYPE html>
 <html lang="en" data-theme="${escapeHtml(activeTheme)}">
 <head>
@@ -2053,6 +2840,30 @@ function buildDashboardTemplate({
   </style>
 </head>
 <body>
+
+  <!-- Universal Sandboxed-Safe In-DOM Modal Dialog -->
+  <div id="hm-modal-backdrop" class="hm-modal-backdrop" style="display: none;">
+    <div class="hm-modal-box" id="hm-modal-box">
+      <div class="hm-modal-header">
+        <h3 id="hm-modal-title" class="hm-modal-title">Dialog</h3>
+        <div class="hm-modal-header-actions">
+          <button id="hm-modal-btn-enlarge" class="hm-modal-enlarge-btn" onclick="toggleModalEnlarge()" title="Enlarge window / Restore">\u26F6</button>
+          <button class="hm-modal-close" onclick="closeAppModal()" title="Close">\u2715</button>
+        </div>
+      </div>
+      <div class="hm-modal-body">
+        <p id="hm-modal-message" class="hm-modal-message"></p>
+        <div id="hm-modal-input-container"></div>
+      </div>
+      <div class="hm-modal-footer">
+        <button class="hm-btn hm-btn-secondary" onclick="closeAppModal()">Cancel</button>
+        <button id="hm-modal-btn-confirm" class="hm-btn hm-btn-primary">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Top Progress Loading Bar -->
+  <div id="hm-top-loader" class="hm-top-loader"><div class="hm-top-loader-bar"></div></div>
 
   <!-- Top Operation Toast Banner -->
   <div id="hm-op-banner" class="hm-op-banner">
@@ -2072,19 +2883,26 @@ function buildDashboardTemplate({
       <button class="hm-btn hm-btn-secondary" style="padding: 4px 10px; font-size: 12px;" onclick="changeActiveNote()" title="Open note search picker">
         \u{1F4C2} Switch Note
       </button>
+      ${session?.noteUUID ? `
+        <button class="hm-btn hm-btn-secondary" style="padding: 4px 10px; font-size: 12px;" onclick="handleOpenNote()" title="Open active note in Amplenote (\u2197)">
+          \u2197 Open Note
+        </button>
+      ` : ""}
     </div>
     <div class="hm-header-right">
       <div class="hm-nav-tabs">
-        <button id="tab-btn-review" class="hm-nav-tab ${activeTab === "review" ? "active" : ""}" onclick="switchTab('review')">Review</button>
-        <button id="tab-btn-settings" class="hm-nav-tab ${activeTab === "settings" ? "active" : ""}" onclick="switchTab('settings')">Settings</button>
+        <button id="tab-btn-review" class="hm-nav-tab ${activeTab === "review" ? "active" : ""}" onclick="switchTab('review')">Studio</button>
+        <button id="tab-btn-history" class="hm-nav-tab ${activeTab === "history" ? "active" : ""}" onclick="switchTab('history')">History Logs (${historyRecords.length})</button>
+        <button id="tab-btn-settings" class="hm-nav-tab ${activeTab === "settings" ? "active" : ""}" onclick="switchTab('settings')">\u2699\uFE0F Settings</button>
       </div>
-      <select id="theme-selector" class="hm-theme-select" onchange="changeTheme(this.value)">
-        ${THEMES.map((t) => `<option value="${t.id}" ${t.id === activeTheme ? "selected" : ""}>${t.icon} ${t.name}</option>`).join("")}
-      </select>
+      <button class="hm-btn hm-btn-secondary" id="theme-cycler-btn" onclick="cycleTheme()" title="Click to cycle themes (or press T)">
+        <span id="theme-icon">\u2615</span>
+        <span id="theme-name">Theme</span>
+      </button>
     </div>
   </header>
 
-  <!-- Main View Area -->
+  <!-- Main View Area (Studio) -->
   <div id="view-review" class="hm-workbench" style="${activeTab === "review" ? "" : "display: none;"}">
     
     <!-- Left Sidebar Inspector -->
@@ -2092,17 +2910,28 @@ function buildDashboardTemplate({
       
       <!-- Preset Selection -->
       <div class="hm-control-group">
-        <label class="hm-section-title">Editorial Preset</label>
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+          <label class="hm-section-title">Editorial Preset</label>
+          <button class="hm-btn hm-btn-secondary" style="padding: 2px 6px; font-size: 11px;" onclick="openCustomPromptModal()" title="Add custom instruction">+ Custom</button>
+        </div>
         <select id="preset-selector" class="hm-select" onchange="onPresetChange(this.value)">
           ${EDITORIAL_PRESETS.map((p) => `
-            <option value="${p.id}" ${session && session.presetId === p.id ? "selected" : ""}>
+            <option value="${p.id}" ${session && session.presetId === p.id && !session.customPrompt ? "selected" : ""}>
               ${p.name}
             </option>
           `).join("")}
+          ${session?.customPrompt ? `<option value="__custom__" selected>\u{1F3AF} Custom Prompt Override</option>` : ""}
         </select>
+        
         <div id="preset-desc-box" class="hm-preset-desc">
-          ${EDITORIAL_PRESETS.find((p) => p.id === (session?.presetId || "human_polish"))?.description || ""}
+          ${session?.customPrompt ? `\u{1F3AF} <em>Custom:</em> "${escapeHtml(session.customPrompt)}"` : EDITORIAL_PRESETS.find((p) => p.id === (session?.presetId || "human_polish"))?.description || ""}
         </div>
+
+        ${session?.customPrompt ? `
+          <button class="hm-btn hm-btn-secondary" style="font-size: 11px; padding: 2px 8px; margin-top: 4px;" onclick="handleClearCustomPrompt()">
+            \u2715 Clear Custom Prompt
+          </button>
+        ` : ""}
       </div>
 
       <!-- Granularity Segmented Control -->
@@ -2149,7 +2978,7 @@ function buildDashboardTemplate({
         <div class="hm-section-title">Shortcuts</div>
         <div><kbd>A</kbd> Accept &bull; <kbd>R</kbd> Reject &bull; <kbd>U</kbd> Undo</div>
         <div><kbd>N</kbd> / <kbd>\u2192</kbd> Next &bull; <kbd>P</kbd> / <kbd>\u2190</kbd> Prev</div>
-        <div><kbd>Enter</kbd> Polish Chunk</div>
+        <div><kbd>T</kbd> Cycle Theme &bull; <kbd>Enter</kbd> Polish Chunk</div>
       </div>
 
     </aside>
@@ -2159,6 +2988,11 @@ function buildDashboardTemplate({
       ${renderCanvasHtml(session)}
     </main>
 
+  </div>
+
+  <!-- History View Area -->
+  <div id="view-history" class="hm-workbench" style="${activeTab === "history" ? "" : "display: none;"}">
+    ${renderHistoryView(historyRecords)}
   </div>
 
   <!-- Settings View Area -->
@@ -2173,16 +3007,34 @@ function buildDashboardTemplate({
           </span>
         </div>
         <p style="font-size: 13px; color: var(--hm-text-muted);">
-          Enter your Hemmingway API key (starts with <code>hemmingway_live_</code>) to connect to <code>hemmingway-27b</code>. 
+          Enter your Hemmingway API key to connect to <code>hemmingway-27b</code>. 
           Manage your keys at <a href="https://hemmingway.io/platform/#keys" target="_blank" style="color: var(--hm-accent);">hemmingway.io/platform/#keys</a>.
         </p>
         <div class="hm-control-group">
-          <label class="hm-section-title">Hemmingway API Key</label>
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <label class="hm-section-title">Hemmingway API Key</label>
+            <button class="hm-btn hm-btn-secondary" style="font-size: 11px; padding: 2px 6px;" onclick="toggleKeyVisibility()">\u{1F441}\uFE0F Show/Hide</button>
+          </div>
           <input type="password" id="input-api-key" class="hm-input" placeholder="hemmingway_live_..." value="${escapeHtml(settings[SETTING_API_KEY] || "")}">
         </div>
         <div class="hm-control-group">
           <label class="hm-section-title">Custom Base URL (Optional)</label>
           <input type="text" id="input-base-url" class="hm-input" placeholder="https://hemmingway.io/v1" value="${escapeHtml(settings[SETTING_BASE_URL] || DEFAULT_BASE_URL)}">
+        </div>
+        <div class="hm-control-group">
+          <label class="hm-section-title">Thinking Mode / Reasoning Effort</label>
+          <select id="input-thinking-effort" class="hm-select">
+            <option value="off" ${settings[SETTING_THINKING_EFFORT] === "off" ? "selected" : ""}>Off (Fastest standard generation)</option>
+            <option value="low" ${settings[SETTING_THINKING_EFFORT] === "low" ? "selected" : ""}>Low (Quick reasoning check)</option>
+            <option value="medium" ${!settings[SETTING_THINKING_EFFORT] || settings[SETTING_THINKING_EFFORT] === "medium" ? "selected" : ""}>Medium (Recommended default)</option>
+            <option value="xhigh" ${settings[SETTING_THINKING_EFFORT] === "xhigh" ? "selected" : ""}>X-High (Maximum deep reflection)</option>
+          </select>
+        </div>
+        <div class="hm-control-group">
+          <label style="display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer;">
+            <input type="checkbox" id="settings-audit-toggle" onchange="toggleAuditNotesSetting(this.checked)">
+            <span>Generate companion report and audit log notes when saving</span>
+          </label>
         </div>
         <div style="display: flex; gap: 10px; margin-top: 8px;">
           <button class="hm-btn hm-btn-primary" onclick="saveSettings()">Save Settings</button>
@@ -2203,6 +3055,7 @@ function buildDashboardTemplate({
               <th>Requests</th>
               <th>Prompt Tokens</th>
               <th>Completion Tokens</th>
+              <th>Thinking Tokens</th>
               <th>Est. Cost (USD)</th>
             </tr>
           </thead>
@@ -2212,6 +3065,7 @@ function buildDashboardTemplate({
               <td>${usageStats.todayRequests || 0}</td>
               <td>${usageStats.todayPromptTokens || 0}</td>
               <td>${usageStats.todayCompletionTokens || 0}</td>
+              <td>${usageStats.todayThinkingTokens || 0}</td>
               <td>$${(usageStats.todayCostUSD || 0).toFixed(4)}</td>
             </tr>
             <tr>
@@ -2219,6 +3073,7 @@ function buildDashboardTemplate({
               <td>${usageStats.lifetimeRequests || 0}</td>
               <td>${usageStats.lifetimePromptTokens || 0}</td>
               <td>${usageStats.lifetimeCompletionTokens || 0}</td>
+              <td>${usageStats.lifetimeThinkingTokens || 0}</td>
               <td>$${(usageStats.lifetimeCostUSD || 0).toFixed(4)}</td>
             </tr>
           </tbody>
@@ -2236,10 +3091,284 @@ function buildDashboardTemplate({
   <script>
     let currentSession = ${serializedSession};
     let currentUsage = ${serializedStats};
+    const RE_REVIEW_REASONS = ${serializedReasons};
+    const THEMES = ${safeJsonEmbed(THEMES)};
+    let activeModalCallback = null;
 
-    function callHost(action, payload = null) {
+    // In-DOM Modal Helpers
+    function showAppPrompt({ title = "Input", message = "", defaultValue = "", isTextarea = false, isLarge = false, allowEnlarge = false, placeholder = "", onConfirm }) {
+      const backdrop = document.getElementById("hm-modal-backdrop");
+      const titleElem = document.getElementById("hm-modal-title");
+      const msgElem = document.getElementById("hm-modal-message");
+      const inputContainer = document.getElementById("hm-modal-input-container");
+      const confirmBtn = document.getElementById("hm-modal-btn-confirm");
+      const enlargeBtn = document.getElementById("hm-modal-btn-enlarge");
+      const box = document.getElementById("hm-modal-box");
+
+      if (!backdrop || !inputContainer) return;
+
+      titleElem.innerText = title;
+      msgElem.innerHTML = message;
+      msgElem.style.display = message ? "block" : "none";
+
+      if (enlargeBtn) enlargeBtn.style.display = allowEnlarge ? "inline-flex" : "none";
+      if (box) {
+        box.classList.toggle("hm-modal-large", isLarge);
+        box.classList.remove("enlarged");
+      }
+
+      if (isTextarea) {
+        inputContainer.innerHTML = '<textarea id="hm-modal-input" class="hm-modal-input" rows="8" style="resize: vertical; font-family: ui-monospace, monospace; font-size: 13.5px;" placeholder="' + escapeHtml(placeholder) + '">' + escapeHtml(defaultValue) + '</textarea>';
+      } else {
+        inputContainer.innerHTML = '<input type="text" id="hm-modal-input" class="hm-modal-input" value="' + escapeHtml(defaultValue) + '" placeholder="' + escapeHtml(placeholder) + '">';
+      }
+
+      confirmBtn.className = "hm-btn hm-btn-primary";
+      confirmBtn.innerText = "Confirm";
+
+      activeModalCallback = () => {
+        const input = document.getElementById("hm-modal-input");
+        const val = input ? input.value : "";
+        closeAppModal();
+        if (typeof onConfirm === "function") onConfirm(val);
+      };
+
+      confirmBtn.onclick = activeModalCallback;
+      backdrop.style.display = "flex";
+      setTimeout(() => document.getElementById("hm-modal-input")?.focus(), 50);
+    }
+
+    function showAppChoice({ title = "Select Option", message = "", options = [], defaultSelected = "", onConfirm }) {
+      const backdrop = document.getElementById("hm-modal-backdrop");
+      const titleElem = document.getElementById("hm-modal-title");
+      const msgElem = document.getElementById("hm-modal-message");
+      const inputContainer = document.getElementById("hm-modal-input-container");
+      const confirmBtn = document.getElementById("hm-modal-btn-confirm");
+
+      if (!backdrop || !inputContainer) return;
+
+      titleElem.innerText = title;
+      msgElem.innerHTML = message;
+      msgElem.style.display = message ? "block" : "none";
+
+      const selectedVal = defaultSelected || (options[0] && options[0].id) || "";
+
+      const optionsHtml = options.map((opt, i) => {
+        const isSel = opt.id === selectedVal || (!selectedVal && i === 0);
+        return '<label class="hm-modal-radio-item ' + (isSel ? 'selected' : '') + '" data-opt-id="' + opt.id + '" onclick="selectModalRadioOption(this.dataset.optId)">' +
+          '<input type="radio" name="modal_choice" value="' + opt.id + '" ' + (isSel ? 'checked' : '') + ' style="margin-top: 3px;">' +
+          '<div>' +
+            '<div style="font-weight: 600; font-size: 13px; color: var(--hm-text-main);">' + (opt.label || opt.name) + '</div>' +
+            (opt.prompt ? '<div style="font-size: 11.5px; color: var(--hm-text-muted); margin-top: 2px;">' + opt.prompt + '</div>' : '') +
+          '</div>' +
+        '</label>';
+      }).join("");
+
+      inputContainer.innerHTML = '<div class="hm-modal-radio-list">' + optionsHtml + '</div>' +
+        '<div id="modal-custom-subinput-area" style="margin-top: 10px; display: none;">' +
+          '<input type="text" id="modal-custom-subinput" class="hm-modal-input" placeholder="Enter custom instructions for Hemmingway...">' +
+        '</div>';
+
+      confirmBtn.className = "hm-btn hm-btn-primary";
+      confirmBtn.innerText = "Apply & Review";
+
+      activeModalCallback = () => {
+        const checkedRadio = document.querySelector('input[name="modal_choice"]:checked');
+        const choiceId = checkedRadio ? checkedRadio.value : selectedVal;
+        const customSub = document.getElementById("modal-custom-subinput")?.value || "";
+        closeAppModal();
+        if (typeof onConfirm === "function") onConfirm(choiceId, customSub);
+      };
+
+      confirmBtn.onclick = activeModalCallback;
+      backdrop.style.display = "flex";
+    }
+
+    function selectModalRadioOption(val) {
+      document.querySelectorAll(".hm-modal-radio-item").forEach(el => {
+        const input = el.querySelector("input");
+        if (input) {
+          const isMatch = input.value === val;
+          input.checked = isMatch;
+          el.classList.toggle("selected", isMatch);
+        }
+      });
+      const subArea = document.getElementById("modal-custom-subinput-area");
+      if (subArea) {
+        subArea.style.display = val === "custom" ? "block" : "none";
+        if (val === "custom") {
+          document.getElementById("modal-custom-subinput")?.focus();
+        }
+      }
+    }
+
+    function showAppConfirm({ title = "Confirm", message = "", confirmLabel = "OK", isDanger = false, onConfirm }) {
+      const backdrop = document.getElementById("hm-modal-backdrop");
+      const titleElem = document.getElementById("hm-modal-title");
+      const msgElem = document.getElementById("hm-modal-message");
+      const inputContainer = document.getElementById("hm-modal-input-container");
+      const confirmBtn = document.getElementById("hm-modal-btn-confirm");
+
+      if (!backdrop) return;
+      titleElem.innerText = title;
+      msgElem.innerHTML = message;
+      msgElem.style.display = message ? "block" : "none";
+      if (inputContainer) inputContainer.innerHTML = "";
+
+      confirmBtn.className = isDanger ? "hm-btn hm-btn-danger" : "hm-btn hm-btn-primary";
+      confirmBtn.innerText = confirmLabel;
+
+      activeModalCallback = () => {
+        closeAppModal();
+        if (typeof onConfirm === "function") onConfirm();
+      };
+
+      confirmBtn.onclick = activeModalCallback;
+      backdrop.style.display = "flex";
+    }
+
+    function closeAppModal() {
+      const backdrop = document.getElementById("hm-modal-backdrop");
+      if (backdrop) backdrop.style.display = "none";
+      activeModalCallback = null;
+    }
+
+    function toggleModalEnlarge() {
+      const box = document.getElementById("hm-modal-box");
+      if (box) box.classList.toggle("enlarged");
+    }
+
+    function promptManualEdit(itemId) {
+      const item = currentSession?.items?.find(it => it.id === itemId);
+      const currentText = item?.editedContent || item?.suggestion || item?.original || "";
+      showAppPrompt({
+        title: "Manual Edit (Item #" + (itemId + 1) + ")",
+        message: "Directly edit the rewritten text before accepting (click \u26F6 to expand full-screen):",
+        defaultValue: currentText,
+        isTextarea: true,
+        isLarge: true,
+        allowEnlarge: true,
+        onConfirm: (edited) => {
+          if (edited !== null && edited !== undefined) {
+            sendAction("manualEditItem", itemId, edited);
+          }
+        }
+      });
+    }
+
+    function openReReviewDialog(itemId) {
+      showAppChoice({
+        title: "Re-Review Item #" + (itemId + 1),
+        message: "Select guidance for re-reviewing this section with Hemmingway-1:",
+        options: RE_REVIEW_REASONS,
+        defaultSelected: "more_human",
+        onConfirm: (choiceId, customSub) => {
+          let instruction = "";
+          if (choiceId === "custom" && customSub && customSub.trim().length > 0) {
+            instruction = customSub.trim();
+          } else {
+            const selected = RE_REVIEW_REASONS.find(r => r.id === choiceId);
+            if (selected) instruction = selected.prompt;
+          }
+          showBanner("Re-reviewing Item #" + (itemId + 1) + " with Hemmingway...");
+          sendAction("reReviewItem", itemId, instruction).then(() => hideBanner());
+        }
+      });
+    }
+
+    function openCustomPromptModal() {
+      const cur = currentSession?.customPrompt || "";
+      showAppPrompt({
+        title: "Custom Editorial Instruction",
+        message: "Provide specific guidance for how Hemmingway should edit or polish your text:",
+        defaultValue: cur,
+        isTextarea: true,
+        isLarge: true,
+        placeholder: "e.g. Write in first person, keep bullet points intact, sound conversational...",
+        onConfirm: (customText) => {
+          const trimmed = (customText || "").trim();
+          if (trimmed.length > 0) {
+            sendAction("setCustomPrompt", trimmed);
+          } else {
+            sendAction("clearCustomPrompt");
+          }
+        }
+      });
+    }
+
+    function handleClearCustomPrompt() {
+      sendAction("clearCustomPrompt");
+    }
+
+    function handleOpenNote() {
+      if (currentSession?.noteUUID) {
+        callHost("openNote", currentSession.noteUUID);
+      }
+    }
+
+    // Synchronized Scrolling for Dual-Pane Diff View
+    function initScrollSync() {
+      const leftPane = document.getElementById("original-pane");
+      const rightPane = document.getElementById("suggestion-pane");
+      if (!leftPane || !rightPane) return;
+
+      let isSyncingLeft = false;
+      let isSyncingRight = false;
+
+      leftPane.onscroll = () => {
+        if (isSyncingLeft) {
+          isSyncingLeft = false;
+          return;
+        }
+        isSyncingRight = true;
+        const maxLeft = leftPane.scrollHeight - leftPane.clientHeight;
+        const maxRight = rightPane.scrollHeight - rightPane.clientHeight;
+        if (maxLeft > 0 && maxRight > 0) {
+          rightPane.scrollTop = (leftPane.scrollTop / maxLeft) * maxRight;
+        } else {
+          rightPane.scrollTop = leftPane.scrollTop;
+        }
+      };
+
+      rightPane.onscroll = () => {
+        if (isSyncingRight) {
+          isSyncingRight = false;
+          return;
+        }
+        isSyncingLeft = true;
+        const maxLeft = leftPane.scrollHeight - leftPane.clientHeight;
+        const maxRight = rightPane.scrollHeight - rightPane.clientHeight;
+        if (maxLeft > 0 && maxRight > 0) {
+          leftPane.scrollTop = (rightPane.scrollTop / maxRight) * maxLeft;
+        } else {
+          leftPane.scrollTop = rightPane.scrollTop;
+        }
+      };
+    }
+
+    // Companion Audit Note setting in localStorage
+    const AUDIT_STORAGE_KEY = "ANP_HEMMINGWAY_CREATE_AUDIT_NOTES";
+    function isAuditNotesEnabled() {
+      try {
+        return localStorage.getItem(AUDIT_STORAGE_KEY) === "true";
+      } catch (e) {
+        return false;
+      }
+    }
+    function toggleAuditNotesSetting(checked) {
+      try {
+        localStorage.setItem(AUDIT_STORAGE_KEY, checked ? "true" : "false");
+      } catch (e) {}
+    }
+    function syncAuditCheckboxes() {
+      const cb = document.getElementById("settings-audit-toggle");
+      if (cb) cb.checked = isAuditNotesEnabled();
+    }
+    syncAuditCheckboxes();
+
+    function callHost(action, ...args) {
       if (typeof window.callAmplenotePlugin === "function") {
-        return window.callAmplenotePlugin(action, payload);
+        return window.callAmplenotePlugin(action, ...args);
       }
       console.warn("callAmplenotePlugin not available in this environment.");
       return Promise.resolve(null);
@@ -2248,38 +3377,61 @@ function buildDashboardTemplate({
     function showBanner(text) {
       const b = document.getElementById("hm-op-banner");
       const t = document.getElementById("hm-op-banner-text");
+      const l = document.getElementById("hm-top-loader");
       if (b && t) {
         t.textContent = text;
         b.style.display = "flex";
       }
+      if (l) l.style.display = "block";
     }
 
     function hideBanner() {
       const b = document.getElementById("hm-op-banner");
+      const l = document.getElementById("hm-top-loader");
       if (b) b.style.display = "none";
+      if (l) l.style.display = "none";
     }
 
     function switchTab(tab) {
       document.getElementById("view-review").style.display = tab === "review" ? "flex" : "none";
+      document.getElementById("view-history").style.display = tab === "history" ? "flex" : "none";
       document.getElementById("view-settings").style.display = tab === "settings" ? "flex" : "none";
       document.getElementById("tab-btn-review").classList.toggle("active", tab === "review");
+      document.getElementById("tab-btn-history").classList.toggle("active", tab === "history");
       document.getElementById("tab-btn-settings").classList.toggle("active", tab === "settings");
     }
 
-    function changeTheme(themeId) {
-      document.documentElement.setAttribute("data-theme", themeId);
-      callHost("setTheme", themeId);
+    let activeThemeIndex = 0;
+    function cycleTheme() {
+      activeThemeIndex = (activeThemeIndex + 1) % THEMES.length;
+      const theme = THEMES[activeThemeIndex];
+      document.documentElement.setAttribute("data-theme", theme.id);
+      const icon = document.getElementById("theme-icon");
+      const name = document.getElementById("theme-name");
+      if (icon) icon.textContent = theme.icon;
+      if (name) name.textContent = theme.name;
+      callHost("setTheme", theme.id);
     }
 
-    async function sendAction(action, payload = null) {
-      const res = await callHost(action, payload);
+    function toggleKeyVisibility() {
+      const inp = document.getElementById("input-api-key");
+      if (inp) {
+        inp.type = inp.type === "password" ? "text" : "password";
+      }
+    }
+
+    async function sendAction(action, ...args) {
+      const res = await callHost(action, ...args);
       if (res) {
         if (res.session) {
           currentSession = res.session;
         }
         if (res.canvasHtml) {
           const mount = document.getElementById("main-canvas-mount");
-          if (mount) mount.innerHTML = res.canvasHtml;
+          if (mount) {
+            mount.innerHTML = res.canvasHtml;
+            initScrollSync();
+          }
         }
         if (res.stats) {
           const pl = document.getElementById("progress-label");
@@ -2315,8 +3467,13 @@ function buildDashboardTemplate({
     }
 
     function onPresetChange(presetId) {
+      if (presetId === "__custom__") {
+        openCustomPromptModal();
+        return;
+      }
       if (currentSession) {
         currentSession.presetId = presetId;
+        currentSession.customPrompt = "";
       }
       sendAction("setPreset", presetId);
     }
@@ -2373,15 +3530,33 @@ function buildDashboardTemplate({
     }
 
     async function applyToNote() {
-      showBanner("Applying changes to note...");
-      await sendAction("applyToNote");
+      showBanner("Applying changes to note in Amplenote...");
+      const res = await sendAction("saveAndCommit", isAuditNotesEnabled());
       hideBanner();
+
+      if (res?.saveResult?.success) {
+        showAppConfirm({
+          title: "Changes Saved Successfully!",
+          message: "All accepted and modified changes have been committed to <strong>" + escapeHtml(currentSession?.noteTitle || "your note") + "</strong>.<br><br>Would you like to open and view the note in Amplenote now?",
+          confirmLabel: "Open Note in Amplenote \u2197",
+          onConfirm: () => {
+            handleOpenNote();
+          }
+        });
+      } else if (res?.saveResult?.cancelled) {
+        showAppConfirm({
+          title: "Save Cancelled",
+          message: "The note was modified externally. Save was cancelled to prevent accidental overwrites.",
+          confirmLabel: "OK"
+        });
+      }
     }
 
     async function saveSettings() {
       const apiKey = document.getElementById("input-api-key").value;
       const baseUrl = document.getElementById("input-base-url").value;
-      await callHost("saveSettings", { apiKey, baseUrl });
+      const thinkingEffort = document.getElementById("input-thinking-effort").value;
+      await callHost("saveSettings", { apiKey, baseUrl, thinkingEffort });
       const badge = document.getElementById("api-status-badge");
       if (badge) {
         const has = Boolean(apiKey && apiKey.trim());
@@ -2409,10 +3584,16 @@ function buildDashboardTemplate({
     }
 
     async function resetUsageStats(all) {
-      if (confirm(all ? "Reset all usage metrics?" : "Reset today's usage metrics?")) {
-        await callHost("resetUsage", { all });
-        location.reload();
-      }
+      showAppConfirm({
+        title: all ? "Reset Lifetime Usage Stats?" : "Reset Today's Usage Stats?",
+        message: "Are you sure you want to reset token usage statistics?",
+        confirmLabel: "Reset",
+        isDanger: true,
+        onConfirm: async () => {
+          await callHost("resetUsage", { all });
+          location.reload();
+        }
+      });
     }
 
     // Keyboard Shortcuts
@@ -2421,7 +3602,9 @@ function buildDashboardTemplate({
         return;
       }
       const key = e.key.toUpperCase();
-      if (key === "A") {
+      if (key === "T") {
+        cycleTheme();
+      } else if (key === "A") {
         e.preventDefault();
         acceptCurrent();
       } else if (key === "R") {
@@ -2441,6 +3624,8 @@ function buildDashboardTemplate({
         reviewCurrentChunk();
       }
     });
+
+    initScrollSync();
   </script>
 </body>
 </html>`;
@@ -2524,10 +3709,17 @@ var plugin = {
     const session = getActiveSession();
     const settings = app.settings || {};
     const usageStats = getUsageStats(app);
+    let historyRecords = [];
+    try {
+      historyRecords = await loadHistoryRecords(app);
+    } catch (err) {
+      console.warn("[Hemmingway] loadHistoryRecords failed:", err);
+    }
     return buildDashboardTemplate({
       session,
       settings,
       usageStats,
+      historyRecords,
       activeTab: activeTabState,
       activeTheme: activeThemeState
     });
@@ -2557,6 +3749,9 @@ var plugin = {
             if (payload.baseUrl !== void 0) {
               await app.setSetting(SETTING_BASE_URL, payload.baseUrl.trim());
             }
+            if (payload.thinkingEffort !== void 0) {
+              await app.setSetting(SETTING_THINKING_EFFORT, payload.thinkingEffort);
+            }
           }
           await app.alert("Settings saved successfully!");
           return buildStateResponse();
@@ -2568,6 +3763,19 @@ var plugin = {
         case "setPreset": {
           if (session) {
             session.presetId = args[1] || "human_polish";
+            session.customPrompt = "";
+          }
+          return buildStateResponse();
+        }
+        case "setCustomPrompt": {
+          if (session) {
+            session.customPrompt = (args[1] || "").trim();
+          }
+          return buildStateResponse();
+        }
+        case "clearCustomPrompt": {
+          if (session) {
+            session.customPrompt = "";
           }
           return buildStateResponse();
         }
@@ -2615,6 +3823,23 @@ var plugin = {
           }
           return buildStateResponse();
         }
+        case "manualEditItem": {
+          const itemId = Number(args[1]);
+          const newText = args[2];
+          if (session && typeof itemId === "number") {
+            session.manualEdit(itemId, newText);
+          }
+          return buildStateResponse();
+        }
+        case "reReviewItem": {
+          const itemId = Number(args[1]);
+          const instruction = args[2] || "";
+          const res = await handleRunReview(app, itemId, instruction);
+          if (!res.ok) {
+            await app.alert(`Re-Review Error: ${res.error}`);
+          }
+          return buildStateResponse({ reviewResult: res });
+        }
         case "undo": {
           if (session) {
             session.undo();
@@ -2633,6 +3858,18 @@ var plugin = {
           }
           return buildStateResponse();
         }
+        case "nextPending": {
+          if (session) {
+            session.nextPending();
+          }
+          return buildStateResponse();
+        }
+        case "prevPending": {
+          if (session) {
+            session.prevPending();
+          }
+          return buildStateResponse();
+        }
         case "jumpTo": {
           if (session) {
             session.jumpTo(Number(args[1]));
@@ -2645,9 +3882,39 @@ var plugin = {
           }
           return buildStateResponse();
         }
+        case "saveAndCommit":
         case "applyToNote": {
-          const res = await handleSaveAndCommit(app);
+          const createAuditNotes = Boolean(args[1]);
+          const res = await handleSaveAndCommit(app, createAuditNotes);
           return buildStateResponse({ saveResult: res });
+        }
+        case "openNote": {
+          const targetUUID = args[1] || session?.noteUUID;
+          if (targetUUID) {
+            try {
+              if (typeof app.openNote === "function") {
+                await app.openNote(targetUUID);
+              } else if (typeof app.navigate === "function") {
+                await app.navigate(`https://www.amplenote.com/notes/${targetUUID}`);
+              }
+            } catch (e) {
+              console.warn("[Hemmingway] openNote error:", e);
+            }
+          }
+          return { ok: true };
+        }
+        case "clearSession": {
+          clearActiveSession();
+          return buildStateResponse();
+        }
+        case "refreshHistory": {
+          activeTabState = "history";
+          if (app.context && typeof app.context.renderEmbed === "function") {
+            await app.context.renderEmbed();
+          } else if (typeof app.renderEmbed === "function") {
+            await app.renderEmbed();
+          }
+          return buildStateResponse();
         }
         case "resetUsage": {
           const payload = args[1] || {};
