@@ -6,6 +6,7 @@
  */
 
 import { getActiveSession, setActiveSession, clearActiveSession } from "./lib/data/store.js";
+import { ReviewSession } from "./lib/engine/reviewSession.js";
 import { launchHemmingway } from "./lib/features/launcher.js";
 import { handleRunReview, handleReviewAll, cancelReviewAll, handleSetGranularity } from "./lib/features/workflow.js";
 import { handleSaveAndCommit } from "./lib/features/saveHandler.js";
@@ -292,6 +293,23 @@ const plugin = {
         case "clearSession": {
           clearActiveSession();
           return buildStateResponse();
+        }
+
+        case "restoreSession": {
+          if (args[1]) {
+            const restored = ReviewSession.fromJSON(args[1]);
+            if (restored) {
+              setActiveSession(restored);
+            }
+          }
+          return buildStateResponse();
+        }
+
+        case "getRevisedContent": {
+          if (session) {
+            return { ok: true, content: session.getReconstructedContent() };
+          }
+          return { ok: false, error: "No active session." };
         }
 
         case "refreshHistory": {

@@ -700,7 +700,6 @@ var HemmingwayClient = class {
     if (thinkingEffort === THINKING_EFFORT_MODES.OFF) {
       payload.enable_thinking = false;
     } else {
-      payload.enable_thinking = true;
       payload.reasoning_effort = thinkingEffort;
     }
     const endpoint = `${this.baseUrl}/chat/completions`;
@@ -759,6 +758,44 @@ var HemmingwayClient = class {
       usage,
       model: data.model || this.model
     };
+  }
+  /**
+   * Retrieves the models list from Hemmingway API (GET /v1/models).
+   * Fast, zero-token endpoint to verify credentials and connectivity.
+   * @returns {Promise<Array<{ id: string, object: string, owned_by: string }>>}
+   */
+  async listModels() {
+    if (!this.apiKey) {
+      throw new Error("No Hemmingway API Key configured. Please enter your API key in Plugin Settings.");
+    }
+    const endpoint = `${this.baseUrl}/models`;
+    let response;
+    try {
+      response = await fetch(endpoint, {
+        method: "GET",
+        headers: {
+          "Authorization": `Bearer ${this.apiKey}`
+        }
+      });
+    } catch (networkErr) {
+      throw new Error(`Network error connecting to Hemmingway API (${endpoint}): ${networkErr.message}`);
+    }
+    const rawText = await response.text();
+    let data;
+    try {
+      data = JSON.parse(rawText);
+    } catch {
+      data = null;
+    }
+    if (!response.ok) {
+      const errorCode = data?.error?.code || `HTTP_${response.status}`;
+      const errorMessage = data?.error?.message || rawText || response.statusText;
+      if (response.status === 401 || errorCode === "bad_key" || errorCode === "signed_out") {
+        throw new Error(`Invalid Hemmingway API key (${errorCode}). Keys must start with "hemmingway_live_".`);
+      }
+      throw new Error(`Hemmingway API Error [${errorCode}]: ${errorMessage}`);
+    }
+    return data?.data || [];
   }
 };
 
@@ -2352,6 +2389,41 @@ body {
   font-size: 12px;
   color: var(--hm-text-muted);
 }
+
+.hm-note-link-btn {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--hm-text-main);
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  border-radius: var(--hm-radius-sm);
+  transition: all 0.15s ease;
+}
+
+.hm-note-link-btn:hover {
+  background: var(--hm-bg-card);
+  border-color: var(--hm-border);
+  color: var(--hm-accent);
+  text-decoration: none;
+}
+
+.hm-tag-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border-radius: 12px;
+  font-size: 11px;
+  font-weight: 600;
+  background: var(--hm-bg-card);
+  color: var(--hm-accent);
+  border: 1px solid var(--hm-border);
+  line-height: 1.3;
+}
 `;
 
 // anp-26-hemmingway/lib/engine/diffEngine.js
@@ -2619,6 +2691,25 @@ function renderJumpOptions(session) {
     return `<option value="${it.id}" ${isCur ? "selected" : ""}>${icon} #${idx + 1}: ${escapeHtml(snippet)}...</option>`;
   }).join("");
 }
+function renderPresetOptions(session) {
+  const categories = ["Voice & Tone", "Conciseness & Style", "Transformation", "Professional & Business", "Correction"];
+  let html = "";
+  for (const cat of categories) {
+    const inCat = EDITORIAL_PRESETS.filter((p) => p.category === cat);
+    if (inCat.length > 0) {
+      html += `<optgroup label="${escapeHtml(cat)}">`;
+      for (const p of inCat) {
+        const isSel = session && session.presetId === p.id && !session.customPrompt;
+        html += `<option value="${p.id}" ${isSel ? "selected" : ""}>${escapeHtml(p.name)}</option>`;
+      }
+      html += `</optgroup>`;
+    }
+  }
+  html += `<optgroup label="Custom Guidance">
+    <option value="__custom__" ${session?.customPrompt ? "selected" : ""}>\u{1F3AF} Custom Prompt Override...</option>
+  </optgroup>`;
+  return html;
+}
 function renderActionButtons(currentItem, canUndo) {
   if (!currentItem) return "";
   const id = currentItem.id;
@@ -2723,6 +2814,10 @@ function renderCanvasHtml(session) {
         <span>Suggested: <strong>${suggWords}</strong>w</span>
         <span>Diff: <strong>${diffWords >= 0 ? "+" + diffWords : diffWords}</strong>w</span>
       </div>
+
+      <button class="hm-btn hm-btn-secondary" style="padding: 2px 8px; font-size: 11px;" onclick="copyRevisedText()" title="Copy full revised note markdown to clipboard">
+        \u{1F4CB} Copy Revised
+      </button>
 
       <div style="font-size: 12px; color: var(--hm-text-muted); display: flex; align-items: center; gap: 8px;">
         <span>Item <strong>#${itemNum}</strong> of <strong>${total}</strong></span>
@@ -2877,15 +2972,26 @@ function buildDashboardTemplate({
     <div class="hm-header-left">
       <span class="hm-brand-logo">\u{1F58B}\uFE0F</span>
       <span class="hm-brand-title">Hemmingway Studio</span>
-      <span id="note-title-badge" class="hm-note-badge" title="${escapeHtml(session?.noteTitle || "No note selected")}">
-        ${session?.noteTitle ? `\u{1F4C4} ${escapeHtml(session.noteTitle)}` : "\u{1F4C4} No note selected"}
-      </span>
-      <button class="hm-btn hm-btn-secondary" style="padding: 4px 10px; font-size: 12px;" onclick="changeActiveNote()" title="Open note search picker">
-        \u{1F4C2} Switch Note
+      ${session?.noteTitle ? `
+        <button class="hm-note-link-btn" onclick="handleOpenNote()" title="Open active note in Amplenote (\u2197)">
+          <span>\u{1F4C4}</span>
+          <strong>${escapeHtml(session.noteTitle)}</strong>
+          <span style="font-size: 11px; opacity: 0.75;">\u2197</span>
+        </button>
+      ` : `
+        <span id="note-title-badge" class="hm-note-badge">\u{1F4C4} No note selected</span>
+      `}
+      ${session?.noteTags && session.noteTags.length > 0 ? `
+        <div style="display: inline-flex; gap: 4px; align-items: center; flex-wrap: wrap;">
+          ${session.noteTags.map((t) => `<span class="hm-tag-pill">#${escapeHtml(String(t).replace(/^#/, ""))}</span>`).join("")}
+        </div>
+      ` : ""}
+      <button class="hm-btn hm-btn-secondary" style="padding: 3px 8px; font-size: 11px;" onclick="changeActiveNote()" title="Open note search picker">
+        \u{1F4C2} ${session ? "Switch Note" : "Select Note"}
       </button>
-      ${session?.noteUUID ? `
-        <button class="hm-btn hm-btn-secondary" style="padding: 4px 10px; font-size: 12px;" onclick="handleOpenNote()" title="Open active note in Amplenote (\u2197)">
-          \u2197 Open Note
+      ${session ? `
+        <button class="hm-btn hm-btn-secondary" style="padding: 3px 8px; font-size: 11px; color: var(--hm-danger);" onclick="confirmResetSession()" title="Reset review session and clear in-progress changes">
+          \u2715 Reset
         </button>
       ` : ""}
     </div>
@@ -2915,12 +3021,7 @@ function buildDashboardTemplate({
           <button class="hm-btn hm-btn-secondary" style="padding: 2px 6px; font-size: 11px;" onclick="openCustomPromptModal()" title="Add custom instruction">+ Custom</button>
         </div>
         <select id="preset-selector" class="hm-select" onchange="onPresetChange(this.value)">
-          ${EDITORIAL_PRESETS.map((p) => `
-            <option value="${p.id}" ${session && session.presetId === p.id && !session.customPrompt ? "selected" : ""}>
-              ${p.name}
-            </option>
-          `).join("")}
-          ${session?.customPrompt ? `<option value="__custom__" selected>\u{1F3AF} Custom Prompt Override</option>` : ""}
+          ${renderPresetOptions(session)}
         </select>
         
         <div id="preset-desc-box" class="hm-preset-desc">
@@ -3346,6 +3447,59 @@ function buildDashboardTemplate({
       };
     }
 
+    // Session Persistence in localStorage
+    const STORAGE_KEY = "ANP_HEMMINGWAY_SESSION_STATE";
+    if (currentSession) {
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(currentSession));
+      } catch (e) {}
+    } else {
+      try {
+        const saved = localStorage.getItem(STORAGE_KEY);
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          if (parsed && parsed.noteUUID && parsed.items && parsed.items.length > 0) {
+            sendAction("restoreSession", parsed);
+          }
+        }
+      } catch (e) {}
+    }
+
+    function confirmResetSession() {
+      showAppConfirm({
+        title: "Reset Review Session?",
+        message: "Are you sure you want to reset the current review session and clear in-progress changes? This will restore the original note baseline.",
+        confirmLabel: "Yes, Reset",
+        isDanger: true,
+        onConfirm: () => {
+          try {
+            localStorage.removeItem(STORAGE_KEY);
+          } catch (e) {}
+          sendAction("clearSession");
+        }
+      });
+    }
+
+    async function copyRevisedText() {
+      const res = await callHost("getRevisedContent");
+      if (res && res.content !== undefined) {
+        try {
+          await navigator.clipboard.writeText(res.content);
+          showBanner("\u2713 Copied full revised note text to clipboard!");
+          setTimeout(hideBanner, 2000);
+        } catch (e) {
+          showAppPrompt({
+            title: "Revised Document Markdown",
+            message: "Copy the full revised text below (click \u26F6 to expand full-screen):",
+            defaultValue: res.content,
+            isTextarea: true,
+            isLarge: true,
+            allowEnlarge: true
+          });
+        }
+      }
+    }
+
     // Companion Audit Note setting in localStorage
     const AUDIT_STORAGE_KEY = "ANP_HEMMINGWAY_CREATE_AUDIT_NOTES";
     function isAuditNotesEnabled() {
@@ -3425,6 +3579,9 @@ function buildDashboardTemplate({
       if (res) {
         if (res.session) {
           currentSession = res.session;
+          try {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(res.session));
+          } catch (e) {}
         }
         if (res.canvasHtml) {
           const mount = document.getElementById("main-canvas-mount");
@@ -3479,6 +3636,30 @@ function buildDashboardTemplate({
     }
 
     async function setGranularity(granularity) {
+      if (currentSession?.granularity === granularity) return;
+      const hasDecidedWork = currentSession && currentSession.items && currentSession.items.some(i => i.status === "accepted" || i.status === "edited" || i.status === "rejected");
+      if (hasDecidedWork) {
+        const stats = currentSession.items.reduce((acc, it) => {
+          if (it.status === "accepted") acc.accepted++;
+          if (it.status === "rejected") acc.rejected++;
+          if (it.status === "edited") acc.edited++;
+          return acc;
+        }, { accepted: 0, rejected: 0, edited: 0 });
+
+        showAppConfirm({
+          title: "Change Review Granularity?",
+          message: "Changing granularity will rebuild review chunks and reset progress.<br><br>Current progress:<br>\u2022 " + stats.accepted + " accepted<br>\u2022 " + stats.rejected + " rejected<br>\u2022 " + stats.edited + " edited<br><br>Proceed and re-chunk note?",
+          confirmLabel: "Start New Review",
+          isDanger: true,
+          onConfirm: async () => {
+            showBanner("Re-tokenizing document...");
+            await sendAction("setGranularity", granularity);
+            hideBanner();
+          }
+        });
+        return;
+      }
+
       showBanner("Re-tokenizing document...");
       await sendAction("setGranularity", granularity);
       hideBanner();
@@ -3646,25 +3827,36 @@ async function testHemmingwayConnection({
   const client = new HemmingwayClient({ apiKey, baseUrl, model });
   const t0 = Date.now();
   try {
-    const res = await client.complete({
-      prompt: "Respond with only the single word: OK",
-      systemPrompt: "You are a health check diagnostic. Answer only with OK.",
-      thinkingEffort: THINKING_EFFORT_MODES.OFF,
-      maxTokens: 10
-    });
+    const models = await client.listModels();
     const latencyMs = Date.now() - t0;
+    const modelObj = models.find((m) => m.id === model) || models[0];
     return {
       ok: true,
       latencyMs,
-      model: res.model,
-      sample: res.content.trim()
+      model: modelObj ? modelObj.id : model,
+      sample: "Authentication verified (0 tokens used)"
     };
-  } catch (err) {
-    return {
-      ok: false,
-      latencyMs: Date.now() - t0,
-      error: err.message || String(err)
-    };
+  } catch (modelsErr) {
+    try {
+      const res = await client.complete({
+        prompt: "Respond with: OK",
+        systemPrompt: "Diagnostic check.",
+        thinkingEffort: THINKING_EFFORT_MODES.OFF,
+        maxTokens: 5
+      });
+      return {
+        ok: true,
+        latencyMs: Date.now() - t0,
+        model: res.model,
+        sample: res.content.trim()
+      };
+    } catch (completeErr) {
+      return {
+        ok: false,
+        latencyMs: Date.now() - t0,
+        error: completeErr.message || modelsErr.message || String(completeErr)
+      };
+    }
   }
 }
 
@@ -3906,6 +4098,21 @@ var plugin = {
         case "clearSession": {
           clearActiveSession();
           return buildStateResponse();
+        }
+        case "restoreSession": {
+          if (args[1]) {
+            const restored = ReviewSession.fromJSON(args[1]);
+            if (restored) {
+              setActiveSession(restored);
+            }
+          }
+          return buildStateResponse();
+        }
+        case "getRevisedContent": {
+          if (session) {
+            return { ok: true, content: session.getReconstructedContent() };
+          }
+          return { ok: false, error: "No active session." };
         }
         case "refreshHistory": {
           activeTabState = "history";

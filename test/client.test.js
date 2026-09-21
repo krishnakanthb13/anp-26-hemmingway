@@ -54,12 +54,35 @@ describe("HemmingwayClient", () => {
 
     const body = JSON.parse(options.body);
     expect(body.model).toBe("hemmingway-27b");
-    expect(body.enable_thinking).toBe(true);
     expect(body.reasoning_effort).toBe("medium");
 
     expect(result.content).toBe("Polished prose from Hemmingway.");
     expect(result.reasoningContent).toContain("Cut three unnecessary adverbs");
     expect(result.usage.total_tokens).toBe(35);
+  });
+
+  test("sends enable_thinking: false when thinking is turned off", async () => {
+    global.fetch.mockResolvedValueOnce({
+      ok: true,
+      text: async () => JSON.stringify({
+        id: "chatcmpl-test456",
+        model: "hemmingway-27b",
+        choices: [{
+          message: { role: "assistant", content: "Fast output." }
+        }],
+        usage: { prompt_tokens: 5, completion_tokens: 5, total_tokens: 10 }
+      })
+    });
+
+    const client = new HemmingwayClient({ apiKey: "hemmingway_live_testkey123" });
+    await client.complete({
+      prompt: "Fast draft",
+      thinkingEffort: THINKING_EFFORT_MODES.OFF
+    });
+
+    const body = JSON.parse(global.fetch.mock.calls[0][1].body);
+    expect(body.enable_thinking).toBe(false);
+    expect(body.reasoning_effort).toBeUndefined();
   });
 
   test("handles bad_key and out_of_credit errors with helpful messages", async () => {
