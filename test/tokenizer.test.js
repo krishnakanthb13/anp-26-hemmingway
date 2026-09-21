@@ -55,4 +55,15 @@ describe("Tokenizer", () => {
     expect(tokens[0].type).toBe("full");
     expect(tokens[0].original).toBe(content);
   });
+
+  test("tokenizes sentences correctly and identifies inspectable text", () => {
+    const markdown = "First sentence. Second sentence.";
+    const tokens = tokenizeSentences(markdown);
+
+    expect(tokens.length).toBe(2);
+    expect(tokens[0].original).toBe("First sentence.");
+    expect(tokens[1].original).toBe("Second sentence.");
+    expect(isInspectableText("Hello world")).toBe(true);
+    expect(isInspectableText("---")).toBe(false);
+  });
 });

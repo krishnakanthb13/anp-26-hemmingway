@@ -56,6 +56,16 @@ describe("Diff Engine", () => {
     expect(html).toContain("strolled");
   });
 
+  test("renderSideBySide outputs dual panes with synchronized scroll ids", () => {
+    const oldText = "The initial draft.";
+    const newText = "The final polish.";
+    const html = renderSideBySide(oldText, newText);
+
+    expect(html).toContain('id="original-pane"');
+    expect(html).toContain('id="suggestion-pane"');
+    expect(html).toContain("hm-diff-side-by-side");
+  });
+
   test("escapeHtml sanitizes script tags and quotes", () => {
     const unsafe = `<script>alert("XSS & 'bad'")</script>`;
     const safe = escapeHtml(unsafe);

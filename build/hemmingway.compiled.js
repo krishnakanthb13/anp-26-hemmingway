@@ -634,7 +634,7 @@ async function launchHemmingway(app, targetNoteUUID = null) {
   }
   const session = new ReviewSession({
     noteUUID: note.uuid,
-    noteTitle: note.name || "Untitled Note",
+    noteTitle: note.name || noteTitle || "Untitled Note",
     noteContent: content,
     noteTags: note.tags || [],
     updatedAt: note.updated || Date.now(),
@@ -3125,10 +3125,10 @@ function buildDashboardTemplate({
         <div class="hm-control-group">
           <label class="hm-section-title">Thinking Mode / Reasoning Effort</label>
           <select id="input-thinking-effort" class="hm-select">
-            <option value="off" ${settings[SETTING_THINKING_EFFORT] === "off" ? "selected" : ""}>Off (Fastest standard generation)</option>
-            <option value="low" ${settings[SETTING_THINKING_EFFORT] === "low" ? "selected" : ""}>Low (Quick reasoning check)</option>
-            <option value="medium" ${!settings[SETTING_THINKING_EFFORT] || settings[SETTING_THINKING_EFFORT] === "medium" ? "selected" : ""}>Medium (Recommended default)</option>
-            <option value="xhigh" ${settings[SETTING_THINKING_EFFORT] === "xhigh" ? "selected" : ""}>X-High (Maximum deep reflection)</option>
+            <option value="off" ${(settings[SETTING_THINKING_EFFORT] || DEFAULT_THINKING_EFFORT) === "off" ? "selected" : ""}>Off (Fastest standard generation)</option>
+            <option value="low" ${(settings[SETTING_THINKING_EFFORT] || DEFAULT_THINKING_EFFORT) === "low" ? "selected" : ""}>Low (Quick reasoning check)</option>
+            <option value="medium" ${(settings[SETTING_THINKING_EFFORT] || DEFAULT_THINKING_EFFORT) === "medium" ? "selected" : ""}>Medium (Recommended default)</option>
+            <option value="xhigh" ${(settings[SETTING_THINKING_EFFORT] || DEFAULT_THINKING_EFFORT) === "xhigh" ? "selected" : ""}>X-High (Maximum deep reflection)</option>
           </select>
         </div>
         <div class="hm-control-group">
@@ -3209,7 +3209,7 @@ function buildDashboardTemplate({
       if (!backdrop || !inputContainer) return;
 
       titleElem.innerText = title;
-      msgElem.innerHTML = message;
+      msgElem.innerText = message;
       msgElem.style.display = message ? "block" : "none";
 
       if (enlargeBtn) enlargeBtn.style.display = allowEnlarge ? "inline-flex" : "none";

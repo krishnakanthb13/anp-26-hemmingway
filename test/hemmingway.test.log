@@ -1,0 +1,97 @@
+(node:16432) ExperimentalWarning: VM Modules is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+PASS anp-26-hemmingway/test/historyViewer.test.js
+  History Viewer ΓÇö Happy Path
+    ΓêÜ loads and parses history records across tag queries without limit key (22 ms)
+  History Viewer ΓÇö Fallback & Edge Cases
+    ΓêÜ falls back to companion changes notes if primary history tag is empty (5 ms)
+    ΓêÜ returns empty array when no notes are found (2 ms)
+    ΓêÜ handles filterNotes exceptions safely (2 ms)
+
+(node:17048) ExperimentalWarning: VM Modules is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+PASS anp-26-hemmingway/test/workflow.test.js
+  Workflow ΓÇö System Prompts
+    ΓêÜ returns preset system prompt by default (13 ms)
+    ΓêÜ prefers custom prompt override if present (1 ms)
+  Workflow ΓÇö Review Execution
+    ΓêÜ runs review on active item, updates suggestion, and records usage (10 ms)
+    ΓêÜ re-reviews item with specific instructions included in system prompt (2 ms)
+    ΓêÜ returns error if API key is missing (8 ms)
+    ΓêÜ returns error if no active session is loaded (1 ms)
+
+(node:5584) ExperimentalWarning: VM Modules is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+PASS anp-26-hemmingway/test/saveHandler.test.js
+  Save Handler ΓÇö Happy Path
+    ΓêÜ saves revised note directly when audit notes are disabled (25 ms)
+    ΓêÜ creates companion report and history note when createAuditNotes is true (9 ms)
+  Save Handler ΓÇö Stale Note Guard & Edge Cases
+    ΓêÜ cancels save if external change detected and user rejects overwrite (2 ms)
+    ΓêÜ proceeds with save if external change detected and user confirms overwrite (1 ms)
+  Save Handler ΓÇö Error Handling
+    ΓêÜ returns error when active session is missing (1 ms)
+    ΓêÜ handles replaceNoteContent API failures safely (1 ms)
+
+PASS anp-26-hemmingway/test/client.test.js
+  HemmingwayClient
+    ΓêÜ throws error when API key is missing (17 ms)
+    ΓêÜ sends valid request payload and parses reasoning_content (5 ms)
+    ΓêÜ sends enable_thinking: false when thinking is turned off (2 ms)
+    ΓêÜ handles bad_key and out_of_credit errors with helpful messages (1 ms)
+
+PASS anp-26-hemmingway/test/historyAndReports.test.js
+  History Manager & Report Generator
+    ΓêÜ getSafeMarkdownFence expands backticks safely (6 ms)
+    ΓêÜ generateHistoryRecord produces valid JSON payload and metadata (5 ms)
+    ΓêÜ parseHistoryNotes extracts JSON records and sorts by timestamp (2 ms)
+    ΓêÜ generateChangesReport formats a detailed markdown document with original snapshot (2 ms)
+
+PASS anp-26-hemmingway/test/usageTracker.test.js
+  Usage Tracker ΓÇö Happy Path
+    ΓêÜ returns default stats when no settings exist (5 ms)
+    ΓêÜ records usage and calculates costs accurately with cached inputs (6 ms)
+    ΓêÜ resets today stats while preserving lifetime stats (1 ms)
+    ΓêÜ resets all stats when all=true (1 ms)
+  Usage Tracker ΓÇö Edge Cases & Rollover
+    ΓêÜ automatically rolls over today counters on a new date while keeping lifetime totals (3 ms)
+    ΓêÜ handles zero or missing usage tokens safely (1 ms)
+  Usage Tracker ΓÇö Error Handling
+    ΓêÜ recovers gracefully from corrupted JSON in settings (1 ms)
+    ΓêÜ safely handles null app or missing setSetting method (2 ms)
+
+PASS anp-26-hemmingway/test/diffEngine.test.js
+  Diff Engine
+    ΓêÜ computes word-level diff correctly (6 ms)
+    ΓêÜ renderCleanProse highlights only additions and keeps equal text (2 ms)
+    ΓêÜ renderInlineDiff includes <del> and <ins> (1 ms)
+    ΓêÜ renderChangesOnly outputs structured changes list (1 ms)
+    ΓêÜ renderSideBySide outputs dual panes with synchronized scroll ids (3 ms)
+    ΓêÜ escapeHtml sanitizes script tags and quotes
+
+PASS anp-26-hemmingway/test/diagnostics.test.js
+  Diagnostics ΓÇö Connection Check
+    ΓêÜ returns ok: true with zero tokens used when listModels succeeds (7 ms)
+    ΓêÜ falls back to minimal chat completion if listModels is unavailable (2 ms)
+    ΓêÜ returns error when API key is empty (9 ms)
+    ΓêÜ returns error when both listModels and completion fail (1 ms)
+
+PASS anp-26-hemmingway/test/tokenizer.test.js
+  Tokenizer
+    ΓêÜ splits paragraphs while preserving empty line separators (4 ms)
+    ΓêÜ protects fenced code blocks from paragraph splitting (3 ms)
+    ΓêÜ protects abbreviations and initials in sentence splitting (4 ms)
+    ΓêÜ handles full note granularity mode (1 ms)
+    ΓêÜ tokenizes sentences correctly and identifies inspectable text (2 ms)
+
+PASS anp-26-hemmingway/test/reviewSession.test.js
+  ReviewSession
+    ΓêÜ initializes items and computes stats (5 ms)
+    ΓêÜ accepts, rejects, and undoes actions (2 ms)
+    ΓêÜ accurately reconstructs content with accepted revisions (2 ms)
+
+Test Suites: 10 passed, 10 total
+Tests:       50 passed, 50 total
+Snapshots:   0 total
+Time:        2.695 s
+Ran all test suites matching /anp-26-hemmingway\\test/i.

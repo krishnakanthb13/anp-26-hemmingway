@@ -1,0 +1,37 @@
+======================================================================
+TEST EXECUTION REPORT — Hemmingway Writing Assistant (anp-26-hemmingway)
+Date: 2026-09-21
+Test Runner: Jest (ESM VM Modules)
+======================================================================
+
+SUMMARY METRICS:
+----------------------------------------------------------------------
+Total Test Suites: 10
+Total Tests:       50
+Passed:            50
+Failed:            0
+Skipped:           0
+Pass Rate:         100%
+Confidence Score:  10/10
+Regression Coverage: Complete
+
+TEST SUITE BREAKDOWN:
+----------------------------------------------------------------------
+1. test/client.test.js               (4/4 passed) - API payload, thinking mode, auth errors
+2. test/diagnostics.test.js          (4/4 passed) - Zero-token check, fallback completion, latency
+3. test/diffEngine.test.js           (6/6 passed) - Word diff, clean prose, inline, side-by-side, changes
+4. test/historyAndReports.test.js    (4/4 passed) - Safe fence, history record, parser, changes report
+5. test/historyViewer.test.js        (4/4 passed) - Note query without limit key, fallback tags
+6. test/reviewSession.test.js        (3/3 passed) - State machine, accept/reject, undo, reconstruct
+7. test/saveHandler.test.js          (6/6 passed) - Stale note guard, audit notes, error recovery
+8. test/tokenizer.test.js            (5/5 passed) - Paragraphs, sentences, code fences, full note
+9. test/usageTracker.test.js         (8/8 passed) - Token tracking, cost formula, cached input, rollover
+10. test/workflow.test.js            (6/6 passed) - Single review, re-review instruction, custom prompts
+
+REGRESSION SAFEGUARDS:
+----------------------------------------------------------------------
+[PASS] Amplenote filterNotes query compatibility (no invalid limit keys)
+[PASS] Stale note overwrite guard (external modification confirmation)
+[PASS] Thinking toggle compatibility (enable_thinking: false sent only when off)
+[PASS] Sandboxed iframe safety (no window.prompt / window.confirm)
+======================================================================
